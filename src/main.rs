@@ -210,18 +210,27 @@ impl Tape {
 }
 
 // ---------------------------------------------------------------------------
-// Section 2: Tokenizer — char-level with BOS token
+// Section 2: Tokenizer — char-level and BPE with BOS token
 // ---------------------------------------------------------------------------
 
-struct Tokenizer {
+struct CharTokenizer {
     chars: Vec<char>,
     char_to_id: HashMap<char, usize>,
-    bos: usize,
-    vocab_size: usize,
+}
+
+struct BpeTokenizer {
+    vocab: Vec<String>,
+    token_to_id: HashMap<String, usize>,
+    merges: Vec<(usize, usize)>,
+}
+
+enum Tokenizer {
+    Char(CharTokenizer),
+    Bpe(BpeTokenizer),
 }
 
 impl Tokenizer {
-    fn from_docs(docs: &[String]) -> Self {
+    fn from_docs_char(docs: &[String]) -> Self {
         let mut chars_set = std::collections::BTreeSet::new();
         for doc in docs {
             for ch in doc.chars() {
@@ -231,31 +240,149 @@ impl Tokenizer {
         let chars: Vec<char> = chars_set.into_iter().collect();
         let char_to_id: HashMap<char, usize> =
             chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-        let bos = chars.len();
-        let vocab_size = chars.len() + 1;
-        Tokenizer {
-            chars,
-            char_to_id,
-            bos,
-            vocab_size,
+        Tokenizer::Char(CharTokenizer { chars, char_to_id })
+    }
+
+    fn from_docs_bpe(docs: &[String], target_vocab_size: usize) -> Self {
+        // Step 1: Build initial char-level vocabulary (sorted)
+        let mut chars_set = std::collections::BTreeSet::new();
+        for doc in docs {
+            for ch in doc.chars() {
+                chars_set.insert(ch);
+            }
         }
+        let initial_chars: Vec<char> = chars_set.into_iter().collect();
+        let mut vocab: Vec<String> = initial_chars.iter().map(|c| c.to_string()).collect();
+        let mut token_to_id: HashMap<String, usize> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+
+        // Step 2: Tokenize all docs into initial char-level token IDs
+        let mut tokenized_docs: Vec<Vec<usize>> = docs
+            .iter()
+            .map(|doc| doc.chars().map(|ch| token_to_id[&ch.to_string()]).collect())
+            .collect();
+
+        let mut merges: Vec<(usize, usize)> = Vec::new();
+
+        // Step 3: Iteratively merge most frequent pair until target vocab size
+        // target_vocab_size includes BOS, so stop when vocab.len() + 1 >= target
+        while vocab.len() + 1 < target_vocab_size {
+            let mut pair_counts: HashMap<(usize, usize), usize> = HashMap::new();
+            for tokens in &tokenized_docs {
+                for window in tokens.windows(2) {
+                    *pair_counts.entry((window[0], window[1])).or_insert(0) += 1;
+                }
+            }
+
+            if pair_counts.is_empty() {
+                break;
+            }
+
+            let &best_pair = pair_counts
+                .iter()
+                .max_by_key(|&(_, &count)| count)
+                .unwrap()
+                .0;
+
+            let new_token = format!("{}{}", vocab[best_pair.0], vocab[best_pair.1]);
+            let new_id = vocab.len();
+            vocab.push(new_token.clone());
+            token_to_id.insert(new_token, new_id);
+            merges.push(best_pair);
+
+            // Apply merge to all tokenized docs
+            for tokens in &mut tokenized_docs {
+                let mut new_tokens = Vec::with_capacity(tokens.len());
+                let mut i = 0;
+                while i < tokens.len() {
+                    if i + 1 < tokens.len()
+                        && tokens[i] == best_pair.0
+                        && tokens[i + 1] == best_pair.1
+                    {
+                        new_tokens.push(new_id);
+                        i += 2;
+                    } else {
+                        new_tokens.push(tokens[i]);
+                        i += 1;
+                    }
+                }
+                *tokens = new_tokens;
+            }
+        }
+
+        Tokenizer::Bpe(BpeTokenizer {
+            vocab,
+            token_to_id,
+            merges,
+        })
+    }
+
+    fn bos(&self) -> usize {
+        match self {
+            Tokenizer::Char(ct) => ct.chars.len(),
+            Tokenizer::Bpe(bt) => bt.vocab.len(),
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.bos() + 1
     }
 
     fn encode(&self, doc: &str) -> Vec<usize> {
-        let mut tokens = Vec::with_capacity(doc.len() + 2);
-        tokens.push(self.bos);
-        for ch in doc.chars() {
-            tokens.push(self.char_to_id[&ch]);
+        let bos = self.bos();
+        match self {
+            Tokenizer::Char(ct) => {
+                let mut tokens = Vec::with_capacity(doc.len() + 2);
+                tokens.push(bos);
+                for ch in doc.chars() {
+                    tokens.push(ct.char_to_id[&ch]);
+                }
+                tokens.push(bos);
+                tokens
+            }
+            Tokenizer::Bpe(bt) => {
+                // Start with char-level tokens
+                let mut tokens: Vec<usize> = doc
+                    .chars()
+                    .map(|ch| bt.token_to_id[&ch.to_string()])
+                    .collect();
+                // Apply merges in priority order
+                for &(a, b) in &bt.merges {
+                    let merged_str = format!("{}{}", bt.vocab[a], bt.vocab[b]);
+                    let merged_id = bt.token_to_id[&merged_str];
+                    let mut new_tokens = Vec::with_capacity(tokens.len());
+                    let mut i = 0;
+                    while i < tokens.len() {
+                        if i + 1 < tokens.len() && tokens[i] == a && tokens[i + 1] == b {
+                            new_tokens.push(merged_id);
+                            i += 2;
+                        } else {
+                            new_tokens.push(tokens[i]);
+                            i += 1;
+                        }
+                    }
+                    tokens = new_tokens;
+                }
+                let mut result = Vec::with_capacity(tokens.len() + 2);
+                result.push(bos);
+                result.extend(tokens);
+                result.push(bos);
+                result
+            }
         }
-        tokens.push(self.bos);
-        tokens
     }
 
-    fn decode(&self, token: usize) -> Option<char> {
-        if token == self.bos {
-            None
-        } else {
-            Some(self.chars[token])
+    fn decode(&self, token: usize) -> Option<String> {
+        let bos = self.bos();
+        if token == bos {
+            return None;
+        }
+        match self {
+            Tokenizer::Char(ct) => Some(ct.chars[token].to_string()),
+            Tokenizer::Bpe(bt) => Some(bt.vocab[token].clone()),
         }
     }
 }
@@ -276,6 +403,18 @@ enum LrSchedule {
     Linear,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum TokenizerType {
+    Char,
+    Bpe,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum InitScale {
+    Flat,
+    Scaled,
+}
+
 struct GptConfig {
     n_layer: usize,
     n_embd: usize,
@@ -286,6 +425,7 @@ struct GptConfig {
     activation: Activation,
     no_final_norm: bool,
     no_learnable_gamma: bool,
+    dropout: f64,
 }
 
 impl GptConfig {
@@ -306,14 +446,17 @@ impl GptConfig {
                 + self.n_head * (
                     self.block_size * (self.head_dim + 1)  // attn logits (dot + scale)
                     + self.block_size * 3             // softmax (sub + exp + div)
+                    + self.block_size * 2             // dropout on attn weights
                     + self.head_dim * self.block_size  // weighted sum
                 )
                 + e * e + e                          // Wo linear
+                + 2 * e                              // dropout (worst case: scale per elem)
                 + e                                  // residual add
                 + 3 * e                              // mlp_norm rmsnorm
                 + 4 * e * e + 4 * e                  // fc1 linear
                 + 4 * e * 6                          // silu (neg, exp, add, pow, mul per elem)
                 + e * 4 * e + e                      // fc2 linear
+                + 2 * e                              // dropout
                 + e                                  // residual add
             )
             + 3 * e                                  // final rmsnorm
@@ -329,21 +472,72 @@ struct Params {
 }
 
 impl Params {
-    fn new(config: &GptConfig, rng: &mut StdRng) -> Self {
+    fn new(config: &GptConfig, rng: &mut StdRng, init_scale: InitScale) -> Self {
         let e = config.n_embd;
+        let n_layer = config.n_layer;
         // Random params: wte + wpe + lm_head + layer weights
         let n_random = config.vocab_size * e   // wte
             + config.block_size * e            // wpe
             + config.vocab_size * e            // lm_head
-            + config.n_layer * (4 * e * e + 4 * e * e + e * 4 * e); // layers
+            + n_layer * (4 * e * e + 4 * e * e + e * 4 * e); // layers
         // Gamma params (init=1.0): initial_norm + final_norm + per-layer (pre-attn + pre-mlp)
-        let n_gamma = (2 + 2 * config.n_layer) * e;
+        let n_gamma = (2 + 2 * n_layer) * e;
         let n = n_random + n_gamma;
 
-        let std_dev = 0.08;
-        let mut data: Vec<f64> = (0..n_random)
-            .map(|_| rng.sample::<f64, _>(StandardNormal) * std_dev)
-            .collect();
+        let mut data: Vec<f64> = Vec::with_capacity(n);
+
+        match init_scale {
+            InitScale::Flat => {
+                let std_dev = 0.08;
+                data.extend((0..n_random).map(|_| rng.sample::<f64, _>(StandardNormal) * std_dev));
+            }
+            InitScale::Scaled => {
+                let emb_std = 0.02;
+                let qkv_std = 1.0 / (e as f64).sqrt();
+                let residual_std = 1.0 / (2.0 * n_layer as f64 * e as f64).sqrt();
+
+                // wte: vocab_size * e
+                for _ in 0..config.vocab_size * e {
+                    data.push(rng.sample::<f64, _>(StandardNormal) * emb_std);
+                }
+                // wpe: block_size * e
+                for _ in 0..config.block_size * e {
+                    data.push(rng.sample::<f64, _>(StandardNormal) * emb_std);
+                }
+                // lm_head: vocab_size * e
+                for _ in 0..config.vocab_size * e {
+                    data.push(rng.sample::<f64, _>(StandardNormal) * emb_std);
+                }
+                // Per-layer weights
+                for _ in 0..n_layer {
+                    // wq: e*e — QKV projection
+                    for _ in 0..e * e {
+                        data.push(rng.sample::<f64, _>(StandardNormal) * qkv_std);
+                    }
+                    // wk: e*e
+                    for _ in 0..e * e {
+                        data.push(rng.sample::<f64, _>(StandardNormal) * qkv_std);
+                    }
+                    // wv: e*e
+                    for _ in 0..e * e {
+                        data.push(rng.sample::<f64, _>(StandardNormal) * qkv_std);
+                    }
+                    // wo: e*e — residual projection
+                    for _ in 0..e * e {
+                        data.push(rng.sample::<f64, _>(StandardNormal) * residual_std);
+                    }
+                    // fc1: 4*e*e — standard
+                    for _ in 0..4 * e * e {
+                        data.push(rng.sample::<f64, _>(StandardNormal) * qkv_std);
+                    }
+                    // fc2: e*4*e — residual projection
+                    for _ in 0..e * 4 * e {
+                        data.push(rng.sample::<f64, _>(StandardNormal) * residual_std);
+                    }
+                }
+            }
+        }
+
         data.extend(std::iter::repeat_n(1.0, n_gamma));
 
         let m = vec![0.0; n];
@@ -532,6 +726,23 @@ fn dot(tape: &mut Tape, a: &[Idx], b: &[Idx]) -> Idx {
     acc
 }
 
+fn dropout(tape: &mut Tape, x: &[Idx], p: f64, rng: &mut StdRng) -> Vec<Idx> {
+    if p == 0.0 {
+        return x.to_vec();
+    }
+    let scale = 1.0 / (1.0 - p);
+    x.iter()
+        .map(|&xi| {
+            if rng.random::<f64>() < p {
+                tape.leaf(0.0)
+            } else {
+                let s = tape.leaf(scale);
+                tape.mul(xi, s)
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gpt_forward(
     tape: &mut Tape,
@@ -542,6 +753,7 @@ fn gpt_forward(
     pos_id: usize,
     keys: &mut [Vec<Vec<Idx>>],
     values: &mut [Vec<Vec<Idx>>],
+    rng: &mut StdRng,
 ) -> Vec<Idx> {
     // Token + position embedding
     let tok_emb = &model.wte[token_id];
@@ -585,6 +797,7 @@ fn gpt_forward(
                 .collect();
 
             let attn_weights = softmax(tape, &attn_logits, c);
+            let attn_weights = dropout(tape, &attn_weights, config.dropout, rng);
 
             // Weighted sum of values
             for j in 0..config.head_dim {
@@ -599,6 +812,7 @@ fn gpt_forward(
         }
 
         x = linear(tape, &x_attn, &layer.attn_wo);
+        x = dropout(tape, &x, config.dropout, rng);
         x = x
             .iter()
             .zip(x_residual.iter())
@@ -614,6 +828,7 @@ fn gpt_forward(
             Activation::Relu => x.iter().map(|&xi| tape.relu(xi)).collect(),
         };
         x = linear(tape, &x, &layer.mlp_fc2);
+        x = dropout(tape, &x, config.dropout, rng);
         x = x
             .iter()
             .zip(x_residual.iter())
@@ -643,14 +858,25 @@ struct AdamConfig {
     grad_clip: f64,
 }
 
-fn train_step(
-    params: &mut Params,
+fn n_trainable(config: &GptConfig, n_params: usize) -> usize {
+    if config.no_learnable_gamma {
+        let e = config.n_embd;
+        config.vocab_size * e
+            + config.block_size * e
+            + config.vocab_size * e
+            + config.n_layer * (4 * e * e + 4 * e * e + e * 4 * e)
+    } else {
+        n_params
+    }
+}
+
+fn forward_backward(
+    params: &Params,
     config: &GptConfig,
     model: &GptModel,
-    adam: &AdamConfig,
     tokens: &[usize],
-    step: usize,
-    num_steps: usize,
+    grads_buf: &mut [f64],
+    rng: &mut StdRng,
 ) -> f64 {
     let n = tokens.len().saturating_sub(1).min(config.block_size);
     if n == 0 {
@@ -677,6 +903,7 @@ fn train_step(
             pos_id,
             &mut keys,
             &mut values,
+            rng,
         );
         let log_probs = log_softmax(&mut tape, &logits, &c);
         let neg_log_prob = tape.mul(log_probs[target_id], c.minus_one);
@@ -690,26 +917,28 @@ fn train_step(
 
     tape.backward(loss);
 
-    // Number of trainable params (excludes frozen gamma when no_learnable_gamma)
-    let n_params = params.len();
-    let n_trainable = if config.no_learnable_gamma {
-        let e = config.n_embd;
-        config.vocab_size * e
-            + config.block_size * e
-            + config.vocab_size * e
-            + config.n_layer * (4 * e * e + 4 * e * e + e * 4 * e)
-    } else {
-        n_params
-    };
+    // Accumulate gradients into grads_buf
+    let nt = n_trainable(config, params.len());
+    for (i, g) in grads_buf.iter_mut().enumerate().take(nt) {
+        *g += tape.grad(Idx(i));
+    }
+
+    loss_val
+}
+
+fn adamw_step(
+    params: &mut Params,
+    config: &GptConfig,
+    adam: &AdamConfig,
+    grads: &[f64],
+    step: usize,
+    num_steps: usize,
+) {
+    let nt = n_trainable(config, params.len());
 
     // Gradient clipping (global norm), disabled when grad_clip <= 0
     let clip_coef = if adam.grad_clip > 0.0 {
-        let grad_norm_sq: f64 = (0..n_trainable)
-            .map(|i| {
-                let g = tape.grad(Idx(i));
-                g * g
-            })
-            .sum();
+        let grad_norm_sq: f64 = grads[..nt].iter().map(|g| g * g).sum();
         let grad_norm = grad_norm_sq.sqrt();
         (adam.grad_clip / (grad_norm + 1e-6)).min(1.0)
     } else {
@@ -734,8 +963,8 @@ fn train_step(
 
     // AdamW update
     let step_i = (step + 1) as i32;
-    for i in 0..n_trainable {
-        let g = tape.grad(Idx(i)) * clip_coef;
+    for (i, &gi) in grads.iter().enumerate().take(nt) {
+        let g = gi * clip_coef;
         params.m[i] = adam.beta1 * params.m[i] + (1.0 - adam.beta1) * g;
         params.v[i] = adam.beta2 * params.v[i] + (1.0 - adam.beta2) * g * g;
         let m_hat = params.m[i] / (1.0 - adam.beta1.powi(step_i));
@@ -743,8 +972,6 @@ fn train_step(
         params.data[i] -=
             lr_t * (m_hat / (v_hat.sqrt() + adam.eps) + adam.weight_decay * params.data[i]);
     }
-
-    loss_val
 }
 
 // ---------------------------------------------------------------------------
@@ -943,8 +1170,8 @@ fn generate_sample(
     let mut keys: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
     let mut values: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
 
-    let mut token_id = tokenizer.bos;
-    let mut sample = Vec::new();
+    let mut token_id = tokenizer.bos();
+    let mut sample = String::new();
 
     for pos_id in 0..config.block_size {
         let logits = gpt_forward_f64(
@@ -960,15 +1187,15 @@ fn generate_sample(
         let probs = softmax_f64(&logit_vals);
 
         token_id = weighted_sample(&probs, rng);
-        if token_id == tokenizer.bos {
+        if token_id == tokenizer.bos() {
             break;
         }
-        if let Some(ch) = tokenizer.decode(token_id) {
-            sample.push(ch);
+        if let Some(s) = tokenizer.decode(token_id) {
+            sample.push_str(&s);
         }
     }
 
-    sample.into_iter().collect()
+    sample
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,23 +1236,33 @@ fn parse_args() -> Args {
                        --embd N        embedding dimension [default: {}]\n  \
                        --heads N       number of attention heads [default: {}]\n  \
                        --block N       context window size [default: {}]\n  \
-                       --activation S  activation function: silu, relu [default: silu]\n  \
-                       --no-final-norm skip final RMSNorm before lm_head\n  \
-                       --no-learnable-gamma  freeze RMSNorm gamma at 1.0\n\n\
+                       --activation S  activation function: silu, relu [default: relu]\n  \
+                       --init-scale S  weight init: flat, scaled [default: flat]\n  \
+                       --no-final-norm skip final RMSNorm before lm_head (default: on)\n  \
+                       --final-norm    enable final RMSNorm before lm_head\n  \
+                       --no-learnable-gamma  freeze RMSNorm gamma at 1.0 (default: on)\n  \
+                       --learnable-gamma     enable learnable RMSNorm gamma\n\n\
                      Training:\n  \
                        --steps N       training steps [default: {}]\n  \
                        --warmup N      LR warmup steps [default: {}]\n  \
                        --lr F          learning rate [default: {}]\n  \
                        --beta1 F       Adam beta1 [default: {}]\n  \
+                       --beta2 F       Adam beta2 [default: {}]\n  \
                        --wd F          weight decay, 0=pure Adam [default: {}]\n  \
                        --grad-clip F   gradient clipping norm, 0=disabled [default: {}]\n  \
-                       --lr-schedule S lr schedule: cosine, linear [default: cosine]\n  \
+                       --lr-schedule S lr schedule: cosine, linear [default: linear]\n  \
+                       --batch N       gradient accumulation batch size [default: {}]\n  \
+                       --dropout F     dropout probability, 0=disabled [default: {}]\n  \
+                       --val-split F   validation split fraction, 0=disabled [default: {}]\n  \
                        --seed N        random seed [default: random]\n\n\
                      Inference:\n  \
                        --temp F        sampling temperature [default: {}]\n  \
                        --samples N     number of samples to generate [default: {}]\n\n\
                      Data:\n  \
                        --input PATH    dataset file [default: {}]\n\n\
+                     Tokenizer:\n  \
+                       --tokenizer S   tokenizer type: char, bpe [default: char]\n  \
+                       --vocab-size N  BPE target vocabulary size [default: 256]\n\n\
                      Checkpoint:\n  \
                        --save PATH     save trained model to file\n  \
                        --load PATH     load model and skip training (inference only)",
@@ -1037,8 +1274,12 @@ fn parse_args() -> Args {
                     args.warmup,
                     args.lr,
                     args.beta1,
+                    args.beta2,
                     args.weight_decay,
                     args.grad_clip,
+                    args.batch_size,
+                    args.dropout,
+                    args.val_split,
                     args.temperature,
                     args.samples,
                     args.input,
@@ -1112,8 +1353,42 @@ fn parse_args() -> Args {
             "--no-final-norm" => {
                 args.no_final_norm = true;
             }
+            "--final-norm" => {
+                args.no_final_norm = false;
+            }
             "--no-learnable-gamma" => {
                 args.no_learnable_gamma = true;
+            }
+            "--learnable-gamma" => {
+                args.no_learnable_gamma = false;
+            }
+            "--beta2" => {
+                i += 1;
+                args.beta2 = parse_val(&raw, i, "--beta2");
+            }
+            "--init-scale" => {
+                i += 1;
+                let s = parse_str(&raw, i, "--init-scale");
+                args.init_scale = match s.as_str() {
+                    "flat" => InitScale::Flat,
+                    "scaled" => InitScale::Scaled,
+                    _ => {
+                        eprintln!("error: --init-scale must be 'flat' or 'scaled', got '{s}'");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--dropout" => {
+                i += 1;
+                args.dropout = parse_val(&raw, i, "--dropout");
+            }
+            "--batch" => {
+                i += 1;
+                args.batch_size = parse_val(&raw, i, "--batch");
+            }
+            "--val-split" => {
+                i += 1;
+                args.val_split = parse_val(&raw, i, "--val-split");
             }
             "--seed" => {
                 i += 1;
@@ -1138,6 +1413,22 @@ fn parse_args() -> Args {
             "--load" => {
                 i += 1;
                 args.load = Some(parse_str(&raw, i, "--load"));
+            }
+            "--tokenizer" => {
+                i += 1;
+                let s = parse_str(&raw, i, "--tokenizer");
+                args.tokenizer_type = match s.as_str() {
+                    "char" => TokenizerType::Char,
+                    "bpe" => TokenizerType::Bpe,
+                    _ => {
+                        eprintln!("error: --tokenizer must be 'char' or 'bpe', got '{s}'");
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--vocab-size" => {
+                i += 1;
+                args.bpe_vocab_size = parse_val(&raw, i, "--vocab-size");
             }
             other => {
                 eprintln!("unknown option: {other}\nrun with --help for usage");
@@ -1202,18 +1493,33 @@ fn validate_args(args: &mut Args) {
     if args.beta1 <= 0.0 || args.beta1 >= 1.0 {
         errors.push("--beta1 must be in (0, 1)".into());
     }
+    if args.beta2 <= 0.0 || args.beta2 >= 1.0 {
+        errors.push("--beta2 must be in (0, 1)".into());
+    }
     if args.grad_clip < 0.0 {
         errors.push("--grad-clip must be >= 0".into());
     }
     if args.temperature <= 0.0 {
         errors.push("--temp must be positive".into());
     }
+    if args.tokenizer_type == TokenizerType::Bpe && args.bpe_vocab_size < 2 {
+        errors.push("--vocab-size must be >= 2 for BPE tokenizer".into());
+    }
+    if args.dropout < 0.0 || args.dropout >= 1.0 {
+        errors.push("--dropout must be in [0, 1)".into());
+    }
+    if args.batch_size == 0 {
+        errors.push("--batch must be >= 1".into());
+    }
+    if args.val_split < 0.0 || args.val_split >= 1.0 {
+        errors.push("--val-split must be in [0, 1)".into());
+    }
 
     // --- hard errors: conflicting values ---
-    if args.n_embd > 0 && args.n_head > 0 && args.n_embd % args.n_head != 0 {
+    if args.n_embd > 0 && args.n_head > 0 && !args.n_embd.is_multiple_of(args.n_head) {
         // try to auto-fix: find nearest valid n_head
         let orig = args.n_head;
-        let candidates: Vec<usize> = (1..=args.n_embd).filter(|h| args.n_embd % h == 0).collect();
+        let candidates: Vec<usize> = (1..=args.n_embd).filter(|h| args.n_embd.is_multiple_of(*h)).collect();
         let best = candidates
             .iter()
             .min_by_key(|&&h| (h as isize - orig as isize).unsigned_abs())
@@ -1240,9 +1546,9 @@ fn validate_args(args: &mut Args) {
             args.steps, args.warmup
         ));
     }
-    if args.lr > 0.01 {
+    if args.lr > 0.05 {
         warnings.push(format!(
-            "--lr {} is high, may cause instability (try <= 0.01)",
+            "--lr {} is high, may cause instability (try <= 0.05)",
             args.lr
         ));
     }
@@ -1294,6 +1600,7 @@ struct Args {
     warmup: usize,
     lr: f64,
     beta1: f64,
+    beta2: f64,
     weight_decay: f64,
     grad_clip: f64,
     lr_schedule: LrSchedule,
@@ -1306,31 +1613,44 @@ struct Args {
     input: String,
     save: Option<String>,
     load: Option<String>,
+    tokenizer_type: TokenizerType,
+    bpe_vocab_size: usize,
+    init_scale: InitScale,
+    dropout: f64,
+    batch_size: usize,
+    val_split: f64,
 }
 
 impl Default for Args {
     fn default() -> Self {
         Args {
-            n_layer: 2,
-            n_embd: 48,
-            n_head: 8,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
             block_size: 16,
-            steps: 7000,
-            warmup: 20,
-            lr: 0.002,
-            beta1: 0.9,
-            weight_decay: 0.01,
-            grad_clip: 1.0,
-            lr_schedule: LrSchedule::Cosine,
-            activation: Activation::Silu,
-            no_final_norm: false,
-            no_learnable_gamma: false,
+            steps: 1000,
+            warmup: 0,
+            lr: 0.01,
+            beta1: 0.85,
+            beta2: 0.99,
+            weight_decay: 0.0,
+            grad_clip: 0.0,
+            lr_schedule: LrSchedule::Linear,
+            activation: Activation::Relu,
+            no_final_norm: true,
+            no_learnable_gamma: true,
             seed: None,
             temperature: 0.5,
             samples: 20,
             input: "input.txt".to_string(),
             save: None,
             load: None,
+            tokenizer_type: TokenizerType::Char,
+            bpe_vocab_size: 256,
+            init_scale: InitScale::Flat,
+            dropout: 0.0,
+            batch_size: 1,
+            val_split: 0.0,
         }
     }
 }
@@ -1351,23 +1671,42 @@ fn save_checkpoint(path: &str, config: &GptConfig, tokenizer: &Tokenizer, params
         config.n_embd as u64,
         config.n_head as u64,
         config.block_size as u64,
-        tokenizer.chars.len() as u64,
     ] {
         buf.extend_from_slice(&v.to_le_bytes());
     }
-    // Architectural flags (v2)
+    // Architectural flags
     buf.push(match config.activation {
         Activation::Silu => 0,
         Activation::Relu => 1,
     });
     buf.push(config.no_final_norm as u8);
     buf.push(config.no_learnable_gamma as u8);
-    // Tokenizer chars (ASCII, 1 byte each for names dataset)
-    for &ch in &tokenizer.chars {
-        let mut utf8_buf = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut utf8_buf);
-        buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        buf.extend_from_slice(encoded.as_bytes());
+    // Tokenizer type + data
+    match tokenizer {
+        Tokenizer::Char(ct) => {
+            buf.push(0u8);
+            buf.extend_from_slice(&(ct.chars.len() as u64).to_le_bytes());
+            for &ch in &ct.chars {
+                let mut utf8_buf = [0u8; 4];
+                let encoded = ch.encode_utf8(&mut utf8_buf);
+                buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                buf.extend_from_slice(encoded.as_bytes());
+            }
+        }
+        Tokenizer::Bpe(bt) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&(bt.vocab.len() as u64).to_le_bytes());
+            for token_str in &bt.vocab {
+                let bytes = token_str.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            buf.extend_from_slice(&(bt.merges.len() as u64).to_le_bytes());
+            for &(a, b) in &bt.merges {
+                buf.extend_from_slice(&(a as u64).to_le_bytes());
+                buf.extend_from_slice(&(b as u64).to_le_bytes());
+            }
+        }
     }
     // Params
     buf.extend_from_slice(&(params.data.len() as u64).to_le_bytes());
@@ -1423,7 +1762,6 @@ fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
     let n_embd = read_u64(&data, &mut pos, path) as usize;
     let n_head = read_u64(&data, &mut pos, path) as usize;
     let block_size = read_u64(&data, &mut pos, path) as usize;
-    let n_chars = read_u64(&data, &mut pos, path) as usize;
 
     if n_head == 0 {
         eprintln!("error: checkpoint '{path}' has n_head=0");
@@ -1444,26 +1782,63 @@ fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
     let no_learnable_gamma = read_bytes(&data, &mut pos, 1, path)[0] != 0;
 
     // Tokenizer
-    let mut chars = Vec::with_capacity(n_chars);
-    for _ in 0..n_chars {
-        let len = read_u32(&data, &mut pos, path) as usize;
-        let bytes = read_bytes(&data, &mut pos, len, path);
-        let s = std::str::from_utf8(bytes).unwrap_or_else(|_| {
-            eprintln!("error: invalid utf8 in checkpoint '{path}'");
+    let tok_type = read_bytes(&data, &mut pos, 1, path)[0];
+    let tokenizer = match tok_type {
+        0 => {
+            // Char tokenizer
+            let n_chars = read_u64(&data, &mut pos, path) as usize;
+            let mut chars = Vec::with_capacity(n_chars);
+            for _ in 0..n_chars {
+                let len = read_u32(&data, &mut pos, path) as usize;
+                let bytes = read_bytes(&data, &mut pos, len, path);
+                let s = std::str::from_utf8(bytes).unwrap_or_else(|_| {
+                    eprintln!("error: invalid utf8 in checkpoint '{path}'");
+                    std::process::exit(1);
+                });
+                chars.push(s.chars().next().unwrap());
+            }
+            let char_to_id: HashMap<char, usize> =
+                chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+            Tokenizer::Char(CharTokenizer { chars, char_to_id })
+        }
+        1 => {
+            // BPE tokenizer
+            let n_tokens = read_u64(&data, &mut pos, path) as usize;
+            let mut vocab = Vec::with_capacity(n_tokens);
+            for _ in 0..n_tokens {
+                let len = read_u32(&data, &mut pos, path) as usize;
+                let bytes = read_bytes(&data, &mut pos, len, path);
+                let s = std::str::from_utf8(bytes).unwrap_or_else(|_| {
+                    eprintln!("error: invalid utf8 in checkpoint '{path}'");
+                    std::process::exit(1);
+                });
+                vocab.push(s.to_string());
+            }
+            let n_merges = read_u64(&data, &mut pos, path) as usize;
+            let mut merges = Vec::with_capacity(n_merges);
+            for _ in 0..n_merges {
+                let a = read_u64(&data, &mut pos, path) as usize;
+                let b = read_u64(&data, &mut pos, path) as usize;
+                merges.push((a, b));
+            }
+            let token_to_id: HashMap<String, usize> = vocab
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.clone(), i))
+                .collect();
+            Tokenizer::Bpe(BpeTokenizer {
+                vocab,
+                token_to_id,
+                merges,
+            })
+        }
+        _ => {
+            eprintln!("error: unknown tokenizer type {tok_type} in checkpoint '{path}'");
             std::process::exit(1);
-        });
-        chars.push(s.chars().next().unwrap());
-    }
-    let char_to_id: HashMap<char, usize> = chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-    let bos = chars.len();
-    let vocab_size = chars.len() + 1;
-    let tokenizer = Tokenizer {
-        chars,
-        char_to_id,
-        bos,
-        vocab_size,
+        }
     };
 
+    let vocab_size = tokenizer.vocab_size();
     let config = GptConfig {
         n_layer,
         n_embd,
@@ -1474,6 +1849,7 @@ fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
         activation,
         no_final_norm,
         no_learnable_gamma,
+        dropout: 0.0,
     };
 
     // Params
@@ -1504,12 +1880,62 @@ fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
         v: vec![0.0; n_params],
     };
 
+    let tok_label = match tokenizer {
+        Tokenizer::Char(_) => "char",
+        Tokenizer::Bpe(_) => "bpe",
+    };
     println!(
-        "loaded checkpoint from {path}: layers={} embd={} heads={} params={}",
-        n_layer, n_embd, n_head, n_params
+        "loaded checkpoint from {path}: layers={} embd={} heads={} params={} tokenizer={}",
+        n_layer, n_embd, n_head, n_params, tok_label
     );
 
     (config, tokenizer, params)
+}
+
+fn compute_val_loss(
+    params: &Params,
+    config: &GptConfig,
+    tokenizer: &Tokenizer,
+    val_docs: &[String],
+) -> f64 {
+    let mut total_loss = 0.0;
+    let mut total_tokens = 0usize;
+    for doc in val_docs {
+        let tokens = tokenizer.encode(doc);
+        let n = tokens.len().saturating_sub(1).min(config.block_size);
+        if n == 0 {
+            continue;
+        }
+        let mut keys: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
+        let mut values: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
+        for pos_id in 0..n {
+            let token_id = tokens[pos_id];
+            let target_id = tokens[pos_id + 1];
+            let logits = gpt_forward_f64(
+                &params.data,
+                config,
+                token_id,
+                pos_id,
+                &mut keys,
+                &mut values,
+            );
+            // log-softmax for the target
+            let max_val = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let log_sum_exp = logits
+                .iter()
+                .map(|&l| (l - max_val).exp())
+                .sum::<f64>()
+                .ln()
+                + max_val;
+            let neg_log_prob = -(logits[target_id] - log_sum_exp);
+            total_loss += neg_log_prob;
+            total_tokens += 1;
+        }
+    }
+    if total_tokens == 0 {
+        return 0.0;
+    }
+    total_loss / total_tokens as f64
 }
 
 fn main() {
@@ -1534,34 +1960,48 @@ fn main() {
             docs.swap(i, j);
         }
 
-        let tokenizer = Tokenizer::from_docs(&docs);
+        let tokenizer = match args.tokenizer_type {
+            TokenizerType::Char => Tokenizer::from_docs_char(&docs),
+            TokenizerType::Bpe => Tokenizer::from_docs_bpe(&docs, args.bpe_vocab_size),
+        };
         let config = GptConfig {
             n_layer: args.n_layer,
             n_embd: args.n_embd,
             block_size: args.block_size,
             n_head: args.n_head,
             head_dim: args.n_embd / args.n_head,
-            vocab_size: tokenizer.vocab_size,
+            vocab_size: tokenizer.vocab_size(),
             activation: args.activation,
             no_final_norm: args.no_final_norm,
             no_learnable_gamma: args.no_learnable_gamma,
+            dropout: args.dropout,
         };
-        let mut params = Params::new(&config, &mut rng);
+        let mut params = Params::new(&config, &mut rng, args.init_scale);
+        let tok_label = match args.tokenizer_type {
+            TokenizerType::Char => "char",
+            TokenizerType::Bpe => "bpe",
+        };
         println!(
-            "docs: {} | vocab: {} | params: {} | layers: {} | embd: {} | heads: {}",
+            "docs: {} | vocab: {} ({}) | params: {} | layers: {} | embd: {} | heads: {}",
             docs.len(),
-            tokenizer.vocab_size,
+            tokenizer.vocab_size(),
+            tok_label,
             params.len(),
             config.n_layer,
             config.n_embd,
             config.n_head
         );
 
+        // Split into train/val
+        let val_count = (docs.len() as f64 * args.val_split) as usize;
+        let val_docs: Vec<String> = docs.drain(docs.len() - val_count..).collect();
+        let train_docs = docs;
+
         // Training
         let adam = AdamConfig {
             lr: args.lr,
             beta1: args.beta1,
-            beta2: 0.99,
+            beta2: args.beta2,
             eps: 1e-8,
             weight_decay: args.weight_decay,
             warmup_steps: args.warmup,
@@ -1569,20 +2009,57 @@ fn main() {
             grad_clip: args.grad_clip,
         };
         let model = GptModel::build(&config);
+        let nt = n_trainable(&config, params.len());
+        let mut grads_buf = vec![0.0; nt];
         let mut recent_losses = VecDeque::with_capacity(101);
+        let mut doc_idx = 0usize;
+        let batch_size = args.batch_size;
+        let train_len = train_docs.len();
+        let mut train_order: Vec<usize> = (0..train_len).collect();
+        // Track epoch boundary for re-shuffling and val loss
+        let mut docs_seen = 0usize;
+        let mut epoch = 0usize;
+
         for step in 0..args.steps {
-            let doc = &docs[step % docs.len()];
-            let tokens = tokenizer.encode(doc);
-            let loss = train_step(
-                &mut params,
-                &config,
-                &model,
-                &adam,
-                &tokens,
-                step,
-                args.steps,
-            );
-            recent_losses.push_back(loss);
+            // Zero gradient buffer
+            for g in grads_buf.iter_mut() {
+                *g = 0.0;
+            }
+
+            let mut batch_loss = 0.0;
+            for _ in 0..batch_size {
+                // Epoch-based re-shuffling
+                if docs_seen > 0 && docs_seen.is_multiple_of(train_len) {
+                    epoch += 1;
+                    // Fisher-Yates shuffle
+                    for i in (1..train_len).rev() {
+                        let j = rng.random_range(0..=i);
+                        train_order.swap(i, j);
+                    }
+                    // Validation loss at epoch boundary
+                    if !val_docs.is_empty() {
+                        let vl = compute_val_loss(&params, &config, &tokenizer, &val_docs);
+                        println!("\nepoch {} | val_loss {:.4}", epoch, vl);
+                    }
+                }
+                let di = train_order[doc_idx % train_len];
+                doc_idx += 1;
+                docs_seen += 1;
+                let doc = &train_docs[di];
+                let tokens = tokenizer.encode(doc);
+                batch_loss +=
+                    forward_backward(&params, &config, &model, &tokens, &mut grads_buf, &mut rng);
+            }
+            // Average gradients and loss
+            let inv_batch = 1.0 / batch_size as f64;
+            for g in grads_buf.iter_mut() {
+                *g *= inv_batch;
+            }
+            batch_loss *= inv_batch;
+
+            adamw_step(&mut params, &config, &adam, &grads_buf, step, args.steps);
+
+            recent_losses.push_back(batch_loss);
             if recent_losses.len() > 100 {
                 recent_losses.pop_front();
             }
@@ -1591,11 +2068,17 @@ fn main() {
                 "\rstep {:4} / {:4} | loss {:.4} | avg100 {:.4}",
                 step + 1,
                 args.steps,
-                loss,
+                batch_loss,
                 avg
             );
         }
         println!();
+
+        // Final val loss
+        if !val_docs.is_empty() {
+            let vl = compute_val_loss(&params, &config, &tokenizer, &val_docs);
+            println!("final val_loss {:.4}", vl);
+        }
 
         if let Some(ref path) = args.save {
             save_checkpoint(path, &config, &tokenizer, &params);
@@ -1726,19 +2209,20 @@ mod tests {
     fn test_checkpoint_roundtrip() {
         let mut rng = StdRng::seed_from_u64(42);
         let docs = vec!["abc".to_string(), "bca".to_string()];
-        let tokenizer = Tokenizer::from_docs(&docs);
+        let tokenizer = Tokenizer::from_docs_char(&docs);
         let config = GptConfig {
             n_layer: 1,
             n_embd: 4,
             block_size: 4,
             n_head: 2,
             head_dim: 2,
-            vocab_size: tokenizer.vocab_size,
+            vocab_size: tokenizer.vocab_size(),
             activation: Activation::Silu,
             no_final_norm: false,
             no_learnable_gamma: false,
+            dropout: 0.0,
         };
-        let params = Params::new(&config, &mut rng);
+        let params = Params::new(&config, &mut rng, InitScale::Flat);
 
         let dir = std::env::temp_dir();
         let path = dir.join("microgpt_test_checkpoint.mgpt");
@@ -1756,9 +2240,8 @@ mod tests {
         assert_eq!(config.vocab_size, config2.vocab_size);
 
         // Tokenizer
-        assert_eq!(tokenizer.chars, tokenizer2.chars);
-        assert_eq!(tokenizer.bos, tokenizer2.bos);
-        assert_eq!(tokenizer.vocab_size, tokenizer2.vocab_size);
+        assert_eq!(tokenizer.vocab_size(), tokenizer2.vocab_size());
+        assert_eq!(tokenizer.bos(), tokenizer2.bos());
 
         // Params
         assert_eq!(params.data.len(), params2.data.len());
@@ -1775,21 +2258,116 @@ mod tests {
     #[test]
     fn test_tokenizer_encode_decode() {
         let docs = vec!["abc".to_string(), "def".to_string()];
-        let tokenizer = Tokenizer::from_docs(&docs);
+        let tokenizer = Tokenizer::from_docs_char(&docs);
 
         let tokens = tokenizer.encode("abc");
         // Should be [BOS, a_id, b_id, c_id, BOS]
         assert_eq!(tokens.len(), 5);
-        assert_eq!(tokens[0], tokenizer.bos);
-        assert_eq!(tokens[4], tokenizer.bos);
+        assert_eq!(tokens[0], tokenizer.bos());
+        assert_eq!(tokens[4], tokenizer.bos());
 
         // Decode non-BOS tokens back
-        assert_eq!(tokenizer.decode(tokens[1]), Some('a'));
-        assert_eq!(tokenizer.decode(tokens[2]), Some('b'));
-        assert_eq!(tokenizer.decode(tokens[3]), Some('c'));
+        assert_eq!(tokenizer.decode(tokens[1]), Some("a".to_string()));
+        assert_eq!(tokenizer.decode(tokens[2]), Some("b".to_string()));
+        assert_eq!(tokenizer.decode(tokens[3]), Some("c".to_string()));
 
         // BOS decodes to None
-        assert_eq!(tokenizer.decode(tokenizer.bos), None);
+        assert_eq!(tokenizer.decode(tokenizer.bos()), None);
+    }
+
+    // --- (d2) BPE tokenizer ---
+
+    #[test]
+    fn test_bpe_encode_decode_roundtrip() {
+        let docs = vec!["aaabdaaabac".to_string(), "aabdaab".to_string()];
+        let tokenizer = Tokenizer::from_docs_bpe(&docs, 10);
+
+        assert!(tokenizer.vocab_size() <= 10);
+        assert!(tokenizer.vocab_size() > 0);
+
+        // Roundtrip: encode then decode should reconstruct original
+        for doc in &docs {
+            let tokens = tokenizer.encode(doc);
+            assert_eq!(tokens[0], tokenizer.bos());
+            assert_eq!(tokens[tokens.len() - 1], tokenizer.bos());
+            let decoded: String = tokens[1..tokens.len() - 1]
+                .iter()
+                .filter_map(|&t| tokenizer.decode(t))
+                .collect();
+            assert_eq!(&decoded, doc);
+        }
+
+        assert_eq!(tokenizer.decode(tokenizer.bos()), None);
+    }
+
+    #[test]
+    fn test_bpe_merges_reduce_token_count() {
+        let docs = vec!["aaaa".to_string()];
+
+        // Char-level: "aaaa" -> [BOS, a, a, a, a, BOS] = 6 tokens
+        let char_tok = Tokenizer::from_docs_char(&docs);
+        let char_tokens = char_tok.encode("aaaa");
+        assert_eq!(char_tokens.len(), 6);
+
+        // BPE with enough vocab: should merge "aa" and produce fewer tokens
+        let bpe_tok = Tokenizer::from_docs_bpe(&docs, 5);
+        let bpe_tokens = bpe_tok.encode("aaaa");
+        assert!(bpe_tokens.len() < char_tokens.len());
+    }
+
+    #[test]
+    fn test_bpe_checkpoint_roundtrip() {
+        let docs = vec!["hello".to_string(), "help".to_string()];
+        let tokenizer = Tokenizer::from_docs_bpe(&docs, 15);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let config = GptConfig {
+            n_layer: 1,
+            n_embd: 4,
+            block_size: 4,
+            n_head: 2,
+            head_dim: 2,
+            vocab_size: tokenizer.vocab_size(),
+            activation: Activation::Silu,
+            no_final_norm: false,
+            no_learnable_gamma: false,
+            dropout: 0.0,
+        };
+        let params = Params::new(&config, &mut rng, InitScale::Flat);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("microgpt_test_bpe_checkpoint.mgpt");
+        let path_str = path.to_str().unwrap();
+
+        save_checkpoint(path_str, &config, &tokenizer, &params);
+        let (config2, tokenizer2, params2) = load_checkpoint(path_str);
+
+        assert_eq!(config.n_layer, config2.n_layer);
+        assert_eq!(config.vocab_size, config2.vocab_size);
+        assert_eq!(tokenizer.vocab_size(), tokenizer2.vocab_size());
+        assert_eq!(tokenizer.bos(), tokenizer2.bos());
+
+        // Encode roundtrip with loaded tokenizer
+        let tokens1 = tokenizer.encode("hello");
+        let tokens2 = tokenizer2.encode("hello");
+        assert_eq!(tokens1, tokens2);
+
+        assert_eq!(params.data.len(), params2.data.len());
+        for (a, b) in params.data.iter().zip(params2.data.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_char_tokenizer_decode_returns_string() {
+        let docs = vec!["abc".to_string()];
+        let tokenizer = Tokenizer::from_docs_char(&docs);
+        let tokens = tokenizer.encode("abc");
+        assert_eq!(tokenizer.decode(tokens[1]), Some("a".to_string()));
+        assert_eq!(tokenizer.decode(tokens[2]), Some("b".to_string()));
+        assert_eq!(tokenizer.decode(tokenizer.bos()), None);
     }
 
     // --- (e) Div backward correctness ---
@@ -1905,5 +2483,109 @@ mod tests {
         let num_b = numerical_grad(|x| a_val.max(0.0) * x, b_val, h);
         assert!((tape.grad(a) - num_a).abs() < 1e-5);
         assert!((tape.grad(b) - num_b).abs() < 1e-5);
+    }
+
+    // --- (h) Dropout tests ---
+
+    #[test]
+    fn test_dropout_zero_is_identity() {
+        let mut tape = Tape::with_capacity(64);
+        let mut rng = StdRng::seed_from_u64(42);
+        let vals = [1.0, 2.0, 3.0, 4.0];
+        let x: Vec<Idx> = vals.iter().map(|&v| tape.leaf(v)).collect();
+        let y = dropout(&mut tape, &x, 0.0, &mut rng);
+        for (i, &yi) in y.iter().enumerate() {
+            assert!(
+                (tape.val(yi) - vals[i]).abs() < 1e-10,
+                "dropout p=0 should be identity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dropout_backward() {
+        let mut tape = Tape::with_capacity(64);
+        let mut rng = StdRng::seed_from_u64(42);
+        let p = 0.5;
+        let vals = [1.0, 2.0, 3.0, 4.0];
+        let x: Vec<Idx> = vals.iter().map(|&v| tape.leaf(v)).collect();
+        let y = dropout(&mut tape, &x, p, &mut rng);
+        let s = tape.sum(&y);
+        tape.backward(s);
+        let scale = 1.0 / (1.0 - p);
+        for (i, &xi) in x.iter().enumerate() {
+            let g = tape.grad(xi);
+            // Gradient should be either 0 (dropped) or 1/(1-p) (kept)
+            assert!(
+                g.abs() < 1e-10 || (g - scale).abs() < 1e-10,
+                "dropout grad at {i} should be 0 or {scale}, got {g}"
+            );
+        }
+    }
+
+    // --- (i) Scaled init test ---
+
+    #[test]
+    fn test_scaled_init_different_from_flat() {
+        let docs = vec!["abc".to_string(), "def".to_string()];
+        let tokenizer = Tokenizer::from_docs_char(&docs);
+        let config = GptConfig {
+            n_layer: 1,
+            n_embd: 4,
+            block_size: 4,
+            n_head: 2,
+            head_dim: 2,
+            vocab_size: tokenizer.vocab_size(),
+            activation: Activation::Relu,
+            no_final_norm: true,
+            no_learnable_gamma: true,
+            dropout: 0.0,
+        };
+        let mut rng1 = StdRng::seed_from_u64(42);
+        let mut rng2 = StdRng::seed_from_u64(42);
+        let flat = Params::new(&config, &mut rng1, InitScale::Flat);
+        let scaled = Params::new(&config, &mut rng2, InitScale::Scaled);
+        assert_eq!(flat.data.len(), scaled.data.len());
+        // They should differ because different std_devs are used
+        let differs = flat
+            .data
+            .iter()
+            .zip(scaled.data.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-15);
+        assert!(
+            differs,
+            "scaled and flat init should produce different weights"
+        );
+    }
+
+    // --- (j) Validation loss test ---
+
+    #[test]
+    fn test_val_loss_is_finite() {
+        let docs = vec!["abc".to_string(), "def".to_string(), "ghi".to_string()];
+        let tokenizer = Tokenizer::from_docs_char(&docs);
+        let config = GptConfig {
+            n_layer: 1,
+            n_embd: 4,
+            block_size: 4,
+            n_head: 2,
+            head_dim: 2,
+            vocab_size: tokenizer.vocab_size(),
+            activation: Activation::Relu,
+            no_final_norm: true,
+            no_learnable_gamma: true,
+            dropout: 0.0,
+        };
+        let mut rng = StdRng::seed_from_u64(42);
+        let params = Params::new(&config, &mut rng, InitScale::Flat);
+        let val_loss = compute_val_loss(&params, &config, &tokenizer, &docs);
+        assert!(
+            val_loss.is_finite(),
+            "val loss should be finite, got {val_loss}"
+        );
+        assert!(
+            val_loss > 0.0,
+            "val loss should be positive, got {val_loss}"
+        );
     }
 }
