@@ -136,15 +136,7 @@ fn test_checkpoint_roundtrip() {
         grad_clip: 0.0,
     };
 
-    let ckpt_save = Checkpoint {
-        config: config.clone(),
-        tokenizer: tokenizer.clone(),
-        params: params.clone(),
-        completed_step: 42,
-        adam: adam.clone(),
-        batch_size: 1,
-    };
-    save_checkpoint(path_str, &ckpt_save);
+    save_checkpoint(path_str, &config, &adam, &tokenizer, &params, 42, 1);
     let ckpt = load_checkpoint(path_str);
 
     // Config
@@ -281,15 +273,7 @@ fn test_bpe_checkpoint_roundtrip() {
         grad_clip: 0.0,
     };
 
-    let ckpt_save = Checkpoint {
-        config: config.clone(),
-        tokenizer: tokenizer.clone(),
-        params: params.clone(),
-        completed_step: 0,
-        adam,
-        batch_size: 1,
-    };
-    save_checkpoint(path_str, &ckpt_save);
+    save_checkpoint(path_str, &config, &adam, &tokenizer, &params, 0, 1);
     let ckpt = load_checkpoint(path_str);
 
     assert_eq!(config.n_layer, ckpt.config.n_layer);
@@ -536,5 +520,259 @@ fn test_val_loss_is_finite() {
     assert!(
         val_loss > 0.0,
         "val loss should be positive, got {val_loss}"
+    );
+}
+
+// --- (k) End-to-end training: loss decreases after 1 step ---
+
+#[test]
+fn test_one_step_training_loss_decreases() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abcabc".to_string(), "defdef".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let mut params = Params::new(&config, &mut rng, InitScale::Flat);
+    let model = GptModel::build(&config);
+    let nt = n_trainable(&config, params.len());
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.85,
+        beta2: 0.99,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
+    let tokens = tokenizer.encode(&docs[0]);
+
+    let mut grads = vec![0.0; nt];
+    let loss0 = forward_backward(&params, &config, &model, &tokens, &mut grads, &mut rng);
+    adamw_step(&mut params, &config, &adam, &grads, 0, 100);
+
+    grads.iter_mut().for_each(|g| *g = 0.0);
+    let loss1 = forward_backward(&params, &config, &model, &tokens, &mut grads, &mut rng);
+    assert!(
+        loss1 < loss0,
+        "loss should decrease after one step: {loss0} -> {loss1}"
+    );
+}
+
+// --- (l) AdamW step updates params, m, v ---
+
+#[test]
+fn test_adamw_step_updates_params() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let mut params = Params::new(&config, &mut rng, InitScale::Flat);
+    let before = params.data.clone();
+    let nt = n_trainable(&config, params.len());
+    let grads: Vec<f64> = (0..nt).map(|i| (i as f64) * 0.01).collect();
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
+    adamw_step(&mut params, &config, &adam, &grads, 0, 100);
+
+    let changed = before
+        .iter()
+        .zip(params.data.iter())
+        .take(nt)
+        .any(|(a, b)| (a - b).abs() > 1e-15);
+    assert!(changed, "params should change after adamw_step");
+    assert!(
+        params.m[1].abs() > 0.0,
+        "m should be non-zero for non-zero gradient"
+    );
+    assert!(
+        params.v[1] > 0.0,
+        "v should be positive for non-zero gradient"
+    );
+}
+
+// --- (m) LR schedule produces different updates at different steps ---
+
+#[test]
+fn test_lr_schedule_values() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let base_params = Params::new(&config, &mut rng, InitScale::Flat);
+    let nt = n_trainable(&config, base_params.len());
+    let grads: Vec<f64> = vec![0.1; nt];
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
+
+    let mut params_early = base_params.clone();
+    let mut params_late = base_params.clone();
+    adamw_step(&mut params_early, &config, &adam, &grads, 0, 100);
+    adamw_step(&mut params_late, &config, &adam, &grads, 99, 100);
+
+    let delta: f64 = params_early
+        .data
+        .iter()
+        .zip(params_late.data.iter())
+        .take(nt)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        delta > 0.0,
+        "different LR schedule positions should produce different updates"
+    );
+}
+
+// --- (n) generate_sample produces valid tokens ---
+
+#[test]
+fn test_generate_sample_valid_tokens() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abc".to_string(), "def".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let params = Params::new(&config, &mut rng, InitScale::Flat);
+    let sample = generate_sample(&params, &config, &tokenizer, 0.5, &mut rng);
+
+    let vocab_chars: std::collections::HashSet<char> =
+        docs.iter().flat_map(|d| d.chars()).collect();
+    for ch in sample.chars() {
+        assert!(
+            vocab_chars.contains(&ch),
+            "generated char '{ch}' not in vocabulary"
+        );
+    }
+}
+
+// --- (o) Edge cases ---
+
+#[test]
+fn test_encode_empty_doc() {
+    let docs = vec!["abc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let tokens = tokenizer.encode("");
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(tokens[0], tokenizer.bos());
+    assert_eq!(tokens[1], tokenizer.bos());
+}
+
+#[test]
+fn test_encode_single_char_doc() {
+    let docs = vec!["a".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let tokens = tokenizer.encode("a");
+    assert_eq!(tokens.len(), 3); // [BOS, a, BOS]
+}
+
+#[test]
+fn test_encode_unknown_chars_skipped() {
+    let docs = vec!["abc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let tokens = tokenizer.encode("azb");
+    // 'z' is not in the vocabulary — should be skipped
+    assert_eq!(tokens.len(), 4); // [BOS, a, b, BOS]
+    assert_eq!(tokens[0], tokenizer.bos());
+    assert_eq!(tokens[3], tokenizer.bos());
+}
+
+#[test]
+fn test_val_loss_with_short_doc() {
+    let docs = vec!["a".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let mut rng = StdRng::seed_from_u64(42);
+    let params = Params::new(&config, &mut rng, InitScale::Flat);
+    let val_loss = compute_val_loss(&params, &config, &tokenizer, &docs);
+    assert!(
+        val_loss.is_finite(),
+        "val loss should be finite for short doc"
+    );
+}
+
+// --- (p) Shuffle helper ---
+
+#[test]
+fn test_shuffle_preserves_elements() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut data: Vec<usize> = (0..10).collect();
+    let original: Vec<usize> = data.clone();
+    shuffle(&mut data, &mut rng);
+
+    let mut sorted = data.clone();
+    sorted.sort();
+    assert_eq!(sorted, original);
+    assert_ne!(
+        data, original,
+        "shuffle should change order (may rarely fail)"
     );
 }

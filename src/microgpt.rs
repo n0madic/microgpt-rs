@@ -10,13 +10,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 
+/// Epsilon for RMSNorm numerical stability (used in both training and inference).
+const RMSNORM_EPS: f64 = 1e-5;
+
+/// Epsilon for gradient norm clipping to avoid division by zero.
+const GRAD_CLIP_EPS: f64 = 1e-6;
+
 // ---------------------------------------------------------------------------
 // Section 1: Autograd Engine — tape-based (Wengert list)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Idx(usize);
 
+#[derive(Debug)]
 pub enum Op {
     Leaf,
     Add(Idx, Idx),
@@ -28,12 +35,14 @@ pub enum Op {
     Relu(Idx),
 }
 
+#[derive(Debug)]
 pub struct Node {
     pub data: f64,
     pub grad: f64,
     pub op: Op,
 }
 
+#[derive(Debug)]
 pub struct Tape {
     pub nodes: Vec<Node>,
 }
@@ -213,20 +222,20 @@ impl Tape {
 // Section 2: Tokenizer — char-level and BPE with BOS token
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CharTokenizer {
     pub chars: Vec<char>,
     pub char_to_id: HashMap<char, usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BpeTokenizer {
     pub vocab: Vec<String>,
     pub token_to_id: HashMap<String, usize>,
     pub merges: Vec<(usize, usize)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Tokenizer {
     Char(CharTokenizer),
     Bpe(BpeTokenizer),
@@ -341,33 +350,36 @@ impl Tokenizer {
                 let mut tokens = Vec::with_capacity(doc.len() + 2);
                 tokens.push(bos);
                 for ch in doc.chars() {
-                    tokens.push(ct.char_to_id[&ch]);
+                    if let Some(&id) = ct.char_to_id.get(&ch) {
+                        tokens.push(id);
+                    }
                 }
                 tokens.push(bos);
                 tokens
             }
             Tokenizer::Bpe(bt) => {
-                // Start with char-level tokens
+                // Start with char-level tokens, skipping unknown characters
                 let mut tokens: Vec<usize> = doc
                     .chars()
-                    .map(|ch| bt.token_to_id[&ch.to_string()])
+                    .filter_map(|ch| bt.token_to_id.get(&ch.to_string()).copied())
                     .collect();
-                // Apply merges in priority order
+                // Apply merges in priority order, reusing buffer to avoid per-merge allocation
+                let mut buf = Vec::with_capacity(tokens.len());
                 for &(a, b) in &bt.merges {
                     let merged_str = format!("{}{}", bt.vocab[a], bt.vocab[b]);
                     let merged_id = bt.token_to_id[&merged_str];
-                    let mut new_tokens = Vec::with_capacity(tokens.len());
+                    buf.clear();
                     let mut i = 0;
                     while i < tokens.len() {
                         if i + 1 < tokens.len() && tokens[i] == a && tokens[i + 1] == b {
-                            new_tokens.push(merged_id);
+                            buf.push(merged_id);
                             i += 2;
                         } else {
-                            new_tokens.push(tokens[i]);
+                            buf.push(tokens[i]);
                             i += 1;
                         }
                     }
-                    tokens = new_tokens;
+                    std::mem::swap(&mut tokens, &mut buf);
                 }
                 let mut result = Vec::with_capacity(tokens.len() + 2);
                 result.push(bos);
@@ -394,31 +406,31 @@ impl Tokenizer {
 // Section 3: Model Config & Parameters
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Activation {
     Silu,
     Relu,
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LrSchedule {
     Cosine,
     Linear,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenizerType {
     Char,
     Bpe,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InitScale {
     Flat,
     Scaled,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GptConfig {
     pub n_layer: usize,
     pub n_embd: usize,
@@ -469,7 +481,7 @@ impl GptConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Params {
     pub data: Vec<f64>,
     pub m: Vec<f64>,
@@ -644,6 +656,7 @@ impl GptModel {
 // Section 5: Forward Pass
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct TapeConstants {
     pub minus_one: Idx,
     pub one: Idx,
@@ -656,7 +669,7 @@ impl TapeConstants {
         TapeConstants {
             minus_one: tape.leaf(-1.0),
             one: tape.leaf(1.0),
-            eps: tape.leaf(1e-5),
+            eps: tape.leaf(RMSNORM_EPS),
             inv_n_embd: tape.leaf(1.0 / n_embd as f64),
         }
     }
@@ -852,7 +865,7 @@ pub fn gpt_forward(
 // Section 6: Training — AdamW optimizer with cosine LR & gradient clipping
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdamConfig {
     pub lr: f64,
     pub beta1: f64,
@@ -946,7 +959,7 @@ pub fn adamw_step(
     let clip_coef = if adam.grad_clip > 0.0 {
         let grad_norm_sq: f64 = grads[..nt].iter().map(|g| g * g).sum();
         let grad_norm = grad_norm_sq.sqrt();
-        (adam.grad_clip / (grad_norm + 1e-6)).min(1.0)
+        (adam.grad_clip / (grad_norm + GRAD_CLIP_EPS)).min(1.0)
     } else {
         1.0
     };
@@ -967,14 +980,14 @@ pub fn adamw_step(
         LrSchedule::Linear => adam.lr * (1.0 - step as f64 / num_steps as f64),
     };
 
-    // AdamW update
-    let step_i = (step + 1) as i32;
+    // AdamW update (use f64 exponent to avoid i32 overflow at >2.1B steps)
+    let step_f = (step + 1) as f64;
     for (i, &gi) in grads.iter().enumerate().take(nt) {
         let g = gi * clip_coef;
         params.m[i] = adam.beta1 * params.m[i] + (1.0 - adam.beta1) * g;
         params.v[i] = adam.beta2 * params.v[i] + (1.0 - adam.beta2) * g * g;
-        let m_hat = params.m[i] / (1.0 - adam.beta1.powi(step_i));
-        let v_hat = params.v[i] / (1.0 - adam.beta2.powi(step_i));
+        let m_hat = params.m[i] / (1.0 - adam.beta1.powf(step_f));
+        let v_hat = params.v[i] / (1.0 - adam.beta2.powf(step_f));
         params.data[i] -=
             lr_t * (m_hat / (v_hat.sqrt() + adam.eps) + adam.weight_decay * params.data[i]);
     }
@@ -983,6 +996,14 @@ pub fn adamw_step(
 // ---------------------------------------------------------------------------
 // Section 7: Inference — tape-free f64 forward pass
 // ---------------------------------------------------------------------------
+
+/// Fisher-Yates shuffle of a mutable slice.
+pub fn shuffle<T>(slice: &mut [T], rng: &mut StdRng) {
+    for i in (1..slice.len()).rev() {
+        let j = rng.random_range(0..=i);
+        slice.swap(i, j);
+    }
+}
 
 pub fn softmax_f64(logits: &[f64]) -> Vec<f64> {
     let max_val = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -1017,7 +1038,7 @@ pub fn linear_f64(x: &[f64], w: &[f64], out_dim: usize) -> Vec<f64> {
 pub fn rmsnorm_f64(x: &[f64], gamma: &[f64]) -> Vec<f64> {
     let n = x.len() as f64;
     let ms: f64 = x.iter().map(|&xi| xi * xi).sum::<f64>() / n;
-    let scale = 1.0 / (ms + 1e-5).sqrt();
+    let scale = 1.0 / (ms + RMSNORM_EPS).sqrt();
     x.iter()
         .zip(gamma.iter())
         .map(|(&xi, &gi)| xi * scale * gi)
@@ -1053,7 +1074,8 @@ pub fn gpt_forward_f64(
     let lm_head_off = off;
     off += config.vocab_size * e;
 
-    // Per-layer weight offsets: wq, wk, wv, wo, fc1, fc2
+    // Per-layer weight count: wq(e²) + wk(e²) + wv(e²) + wo(e²) = 4e²,
+    // fc1(4e·e) = 4e², fc2(e·4e) = 4e² → total 12e²
     let layer_random_size = 4 * e * e + 4 * e * e + e * 4 * e;
     let layers_off = off;
     off += config.n_layer * layer_random_size;
@@ -1210,6 +1232,7 @@ pub fn generate_sample(
 
 const CHECKPOINT_MAGIC: &[u8; 4] = b"MGPT";
 
+#[derive(Debug)]
 pub struct Checkpoint {
     pub config: GptConfig,
     pub tokenizer: Tokenizer,
@@ -1277,16 +1300,24 @@ struct CheckpointData {
     batch_size: usize,
 }
 
-pub fn save_checkpoint(path: &str, ckpt: &Checkpoint) {
+pub fn save_checkpoint(
+    path: &str,
+    config: &GptConfig,
+    adam: &AdamConfig,
+    tokenizer: &Tokenizer,
+    params: &Params,
+    completed_step: usize,
+    batch_size: usize,
+) {
     let data = CheckpointData {
-        config: ckpt.config.clone(),
-        adam: ckpt.adam.clone(),
-        tokenizer: TokenizerData::from_tokenizer(&ckpt.tokenizer),
-        params_data: ckpt.params.data.clone(),
-        params_m: ckpt.params.m.clone(),
-        params_v: ckpt.params.v.clone(),
-        completed_step: ckpt.completed_step,
-        batch_size: ckpt.batch_size,
+        config: config.clone(),
+        adam: adam.clone(),
+        tokenizer: TokenizerData::from_tokenizer(tokenizer),
+        params_data: params.data.clone(),
+        params_m: params.m.clone(),
+        params_v: params.v.clone(),
+        completed_step,
+        batch_size,
     };
     let mut buf = CHECKPOINT_MAGIC.to_vec();
     buf.extend(rmp_serde::to_vec_named(&data).expect("failed to serialize checkpoint"));
@@ -1373,6 +1404,9 @@ pub fn compute_val_loss(
             );
             // log-softmax for the target
             let max_val = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if !max_val.is_finite() {
+                continue;
+            }
             let log_sum_exp = logits
                 .iter()
                 .map(|&l| (l - max_val).exp())

@@ -7,8 +7,8 @@
 mod microgpt;
 pub use microgpt::*;
 
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
@@ -410,6 +410,7 @@ fn validate_args(args: &mut Args) {
     }
 }
 
+#[derive(Debug)]
 struct Args {
     n_layer: usize,
     n_embd: usize,
@@ -501,11 +502,7 @@ fn main() {
             // Load dataset only if we'll continue training
             let docs = if args.steps > 0 {
                 let mut d = load_dataset(&args.input);
-                let n = d.len();
-                for i in (1..n).rev() {
-                    let j = rng.random_range(0..=i);
-                    d.swap(i, j);
-                }
+                shuffle(&mut d, &mut rng);
                 d
             } else {
                 Vec::new()
@@ -521,11 +518,7 @@ fn main() {
             )
         } else {
             let mut docs = load_dataset(&args.input);
-            let n = docs.len();
-            for i in (1..n).rev() {
-                let j = rng.random_range(0..=i);
-                docs.swap(i, j);
-            }
+            shuffle(&mut docs, &mut rng);
 
             let tokenizer = match args.tokenizer_type {
                 TokenizerType::Char => Tokenizer::from_docs_char(&docs),
@@ -607,10 +600,7 @@ fn main() {
             for _ in 0..batch_size {
                 if docs_seen > 0 && docs_seen.is_multiple_of(train_len) {
                     epoch += 1;
-                    for k in (1..train_len).rev() {
-                        let j = rng.random_range(0..=k);
-                        train_order.swap(k, j);
-                    }
+                    shuffle(&mut train_order, &mut rng);
                     if !val_docs.is_empty() {
                         let vl = compute_val_loss(&params, &config, &tokenizer, &val_docs);
                         println!("\nepoch {} | val_loss {:.4}", epoch, vl);
@@ -669,15 +659,15 @@ fn main() {
         }
 
         if let Some(ref path) = args.save {
-            let ckpt = Checkpoint {
-                config: config.clone(),
-                tokenizer: tokenizer.clone(),
-                params: params.clone(),
-                completed_step: step_offset + args.steps,
-                adam: adam.clone(),
+            save_checkpoint(
+                path,
+                &config,
+                &adam,
+                &tokenizer,
+                &params,
+                step_offset + args.steps,
                 batch_size,
-            };
-            save_checkpoint(path, &ckpt);
+            );
         }
     }
 

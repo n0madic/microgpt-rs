@@ -1,6 +1,6 @@
 # microgpt-rs
 
-The most atomic way to train and run inference for a GPT — in pure Rust, in a single file.
+The most atomic way to train and run inference for a GPT — in pure Rust.
 
 Inspired by [Karpathy's microgpt.py](https://gist.github.com/karpathy/8627fe009c40f57531cb18360106ce95). Same educational spirit, idiomatic Rust. Tape-based autograd instead of pointer graph.
 
@@ -13,7 +13,8 @@ Inspired by [Karpathy's microgpt.py](https://gist.github.com/karpathy/8627fe009c
 - **Checkpoint** save/load for trained models (architecture stored in file)
 - **Train/validation split** with tape-free validation loss
 - **Epoch-based data re-shuffling** for better generalization
-- No frameworks, no BLAS, no GPU — just `rand` crate and arithmetic
+- **OOV-safe tokenizer**: unknown characters are silently skipped during encoding
+- No frameworks, no BLAS, no GPU — just `rand` and `serde` crates
 
 ## Quick start
 
@@ -28,7 +29,10 @@ cargo run --release
 cargo run --release -- --save model.mgpt
 
 # Load checkpoint and generate (no training)
-cargo run --release -- --load model.mgpt --samples 50
+cargo run --release -- --load model.mgpt --steps 0 --samples 50
+
+# Resume training from checkpoint
+cargo run --release -- --load model.mgpt --steps 500
 
 # Custom architecture
 cargo run --release -- --layers 4 --embd 64 --heads 8 --steps 5000 --save big.mgpt
@@ -80,8 +84,8 @@ Tokenizer:
   --vocab-size N  BPE target vocabulary size [default: 256]
 
 Checkpoint:
-  --save PATH     save trained model to file
-  --load PATH     load model and skip training (inference only)
+  --save PATH     save model checkpoint after training
+  --load PATH     load checkpoint and resume training (--steps 0 for inference only)
 ```
 
 ## Recommended settings for better training
@@ -144,14 +148,14 @@ Key considerations when scaling:
 ## Example output
 
 ```
-docs: 32033 | vocab: 27 (char) | params: 1936 | layers: 1 | embd: 16 | heads: 4
-step 1000 / 1000 | loss 2.7284 | avg100 2.7536
+docs: 32033 | vocab: 27 (char) | params: 4256 | layers: 1 | embd: 16 | heads: 4
+step 1000 / 1000 | loss 2.1570 | avg100 2.3604 | eta 0s
 --- generated samples ---
-sample  1: ala
-sample  2: ley
-sample  3: rian
-sample  4: ael
-sample  5: sel
+karay
+salinen
+aranile
+doren
+kahar
 ```
 
 ## Architecture
@@ -197,7 +201,8 @@ Training and inference are optimized without sacrificing correctness:
 - **Zero-alloc dot product**: `dot()` accumulates in-place instead of collecting into intermediate `Vec`.
 - **Shared constants**: frequently used leaf nodes (`-1.0`, `1.0`, `eps`) are created once per step and reused across all operations.
 - **One-time model index build**: `GptModel::build()` creates the parameter index template once; each training step only loads parameter values.
+- **BPE swap-buffer**: BPE encode reuses a single buffer across merge iterations instead of allocating per merge.
 
 ## Checkpoint format
 
-Binary file (`.mgpt`): magic header + model config + architectural flags (activation, norm settings) + tokenizer type and vocabulary (char or BPE with merge rules) + raw f64 parameters. Full architecture is stored in the file, so `--load` doesn't need any model flags.
+Binary file (`.mgpt`) using MessagePack serialization: magic header (`MGPT`) + model config + optimizer config (AdamW hyperparameters) + tokenizer (char vocabulary or BPE vocabulary with merge rules) + model parameters + optimizer state (Adam m/v vectors) + training progress (completed step, batch size). Full architecture and training state are stored in the file, so `--load` doesn't need any model flags and can resume training seamlessly.
