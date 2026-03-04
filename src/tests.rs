@@ -125,26 +125,52 @@ fn test_checkpoint_roundtrip() {
     let path = dir.join("microgpt_test_checkpoint.mgpt");
     let path_str = path.to_str().unwrap();
 
-    save_checkpoint(path_str, &config, &tokenizer, &params);
-    let (config2, tokenizer2, params2) = load_checkpoint(path_str);
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.85,
+        beta2: 0.99,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
+
+    save_checkpoint(path_str, &config, &tokenizer, &params, 42, &adam, 1);
+    let ckpt = load_checkpoint(path_str);
 
     // Config
-    assert_eq!(config.n_layer, config2.n_layer);
-    assert_eq!(config.n_embd, config2.n_embd);
-    assert_eq!(config.n_head, config2.n_head);
-    assert_eq!(config.block_size, config2.block_size);
-    assert_eq!(config.head_dim, config2.head_dim);
-    assert_eq!(config.vocab_size, config2.vocab_size);
+    assert_eq!(config.n_layer, ckpt.config.n_layer);
+    assert_eq!(config.n_embd, ckpt.config.n_embd);
+    assert_eq!(config.n_head, ckpt.config.n_head);
+    assert_eq!(config.block_size, ckpt.config.block_size);
+    assert_eq!(config.head_dim, ckpt.config.head_dim);
+    assert_eq!(config.vocab_size, ckpt.config.vocab_size);
 
     // Tokenizer
-    assert_eq!(tokenizer.vocab_size(), tokenizer2.vocab_size());
-    assert_eq!(tokenizer.bos(), tokenizer2.bos());
+    assert_eq!(tokenizer.vocab_size(), ckpt.tokenizer.vocab_size());
+    assert_eq!(tokenizer.bos(), ckpt.tokenizer.bos());
 
     // Params
-    assert_eq!(params.data.len(), params2.data.len());
-    for (a, b) in params.data.iter().zip(params2.data.iter()) {
+    assert_eq!(params.data.len(), ckpt.params.data.len());
+    for (&a, &b) in params.data.iter().zip(ckpt.params.data.iter()) {
         assert_eq!(a.to_bits(), b.to_bits(), "param mismatch: {a} vs {b}");
     }
+
+    // Optimizer state (m/v) round-trip
+    for (&a, &b) in params.m.iter().zip(ckpt.params.m.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "m mismatch");
+    }
+    for (&a, &b) in params.v.iter().zip(ckpt.params.v.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "v mismatch");
+    }
+
+    // Training state
+    assert_eq!(ckpt.completed_step, 42);
+    assert_eq!(ckpt.batch_size, 1);
+    assert_eq!(ckpt.adam.lr.to_bits(), adam.lr.to_bits());
+    assert_eq!(ckpt.adam.beta1.to_bits(), adam.beta1.to_bits());
+    assert_eq!(ckpt.adam.beta2.to_bits(), adam.beta2.to_bits());
 
     // Cleanup
     let _ = std::fs::remove_file(path_str);
@@ -236,21 +262,32 @@ fn test_bpe_checkpoint_roundtrip() {
     let path = dir.join("microgpt_test_bpe_checkpoint.mgpt");
     let path_str = path.to_str().unwrap();
 
-    save_checkpoint(path_str, &config, &tokenizer, &params);
-    let (config2, tokenizer2, params2) = load_checkpoint(path_str);
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.85,
+        beta2: 0.99,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
 
-    assert_eq!(config.n_layer, config2.n_layer);
-    assert_eq!(config.vocab_size, config2.vocab_size);
-    assert_eq!(tokenizer.vocab_size(), tokenizer2.vocab_size());
-    assert_eq!(tokenizer.bos(), tokenizer2.bos());
+    save_checkpoint(path_str, &config, &tokenizer, &params, 0, &adam, 1);
+    let ckpt = load_checkpoint(path_str);
+
+    assert_eq!(config.n_layer, ckpt.config.n_layer);
+    assert_eq!(config.vocab_size, ckpt.config.vocab_size);
+    assert_eq!(tokenizer.vocab_size(), ckpt.tokenizer.vocab_size());
+    assert_eq!(tokenizer.bos(), ckpt.tokenizer.bos());
 
     // Encode roundtrip with loaded tokenizer
     let tokens1 = tokenizer.encode("hello");
-    let tokens2 = tokenizer2.encode("hello");
+    let tokens2 = ckpt.tokenizer.encode("hello");
     assert_eq!(tokens1, tokens2);
 
-    assert_eq!(params.data.len(), params2.data.len());
-    for (a, b) in params.data.iter().zip(params2.data.iter()) {
+    assert_eq!(params.data.len(), ckpt.params.data.len());
+    for (&a, &b) in params.data.iter().zip(ckpt.params.data.iter()) {
         assert_eq!(a.to_bits(), b.to_bits());
     }
 

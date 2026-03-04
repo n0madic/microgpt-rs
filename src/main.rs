@@ -80,8 +80,8 @@ fn parse_args() -> Args {
                        --tokenizer S   tokenizer type: char, bpe [default: char]\n  \
                        --vocab-size N  BPE target vocabulary size [default: 256]\n\n\
                      Checkpoint:\n  \
-                       --save PATH     save trained model to file\n  \
-                       --load PATH     load model and skip training (inference only)",
+                       --save PATH     save model checkpoint after training\n  \
+                       --load PATH     load checkpoint and resume training (--steps 0 for inference only)",
                     args.n_layer,
                     args.n_embd,
                     args.n_head,
@@ -297,8 +297,9 @@ fn validate_args(args: &mut Args) {
         errors
             .push("--block must be >= 2 (need at least 2 tokens for next-token prediction)".into());
     }
-    if args.steps == 0 {
-        errors.push("--steps must be >= 1".into());
+    if args.steps == 0 && args.load.is_none() {
+        errors
+            .push("--steps must be >= 1 (or use --load with --steps 0 for inference only)".into());
     }
     if args.lr <= 0.0 {
         errors.push("--lr must be positive".into());
@@ -493,97 +494,123 @@ fn main() {
     });
     let mut rng = StdRng::seed_from_u64(seed);
 
-    let (config, tokenizer, params) = if let Some(ref path) = args.load {
-        // Load from checkpoint — skip training
-        load_checkpoint(path)
-    } else {
-        // Build from dataset
-        let mut docs = load_dataset(&args.input);
-        let n = docs.len();
-        for i in (1..n).rev() {
-            let j = rng.random_range(0..=i);
-            docs.swap(i, j);
-        }
+    // Determine model source: checkpoint or fresh build
+    let (config, tokenizer, mut params, step_offset, adam, batch_size, docs) =
+        if let Some(ref path) = args.load {
+            let ckpt = load_checkpoint(path);
+            // Load dataset only if we'll continue training
+            let docs = if args.steps > 0 {
+                let mut d = load_dataset(&args.input);
+                let n = d.len();
+                for i in (1..n).rev() {
+                    let j = rng.random_range(0..=i);
+                    d.swap(i, j);
+                }
+                d
+            } else {
+                Vec::new()
+            };
+            (
+                ckpt.config,
+                ckpt.tokenizer,
+                ckpt.params,
+                ckpt.completed_step,
+                ckpt.adam,
+                ckpt.batch_size,
+                docs,
+            )
+        } else {
+            let mut docs = load_dataset(&args.input);
+            let n = docs.len();
+            for i in (1..n).rev() {
+                let j = rng.random_range(0..=i);
+                docs.swap(i, j);
+            }
 
-        let tokenizer = match args.tokenizer_type {
-            TokenizerType::Char => Tokenizer::from_docs_char(&docs),
-            TokenizerType::Bpe => Tokenizer::from_docs_bpe(&docs, args.bpe_vocab_size),
+            let tokenizer = match args.tokenizer_type {
+                TokenizerType::Char => Tokenizer::from_docs_char(&docs),
+                TokenizerType::Bpe => Tokenizer::from_docs_bpe(&docs, args.bpe_vocab_size),
+            };
+            let config = GptConfig {
+                n_layer: args.n_layer,
+                n_embd: args.n_embd,
+                block_size: args.block_size,
+                n_head: args.n_head,
+                head_dim: args.n_embd / args.n_head,
+                vocab_size: tokenizer.vocab_size(),
+                activation: args.activation,
+                no_final_norm: args.no_final_norm,
+                no_learnable_gamma: args.no_learnable_gamma,
+                dropout: args.dropout,
+            };
+            let params = Params::new(&config, &mut rng, args.init_scale);
+            let tok_label = match args.tokenizer_type {
+                TokenizerType::Char => "char",
+                TokenizerType::Bpe => "bpe",
+            };
+            println!(
+                "docs: {} | vocab: {} ({}) | params: {} | layers: {} | embd: {} | heads: {}",
+                docs.len(),
+                tokenizer.vocab_size(),
+                tok_label,
+                params.len(),
+                config.n_layer,
+                config.n_embd,
+                config.n_head
+            );
+
+            let adam = AdamConfig {
+                lr: args.lr,
+                beta1: args.beta1,
+                beta2: args.beta2,
+                eps: 1e-8,
+                weight_decay: args.weight_decay,
+                warmup_steps: args.warmup,
+                schedule: args.lr_schedule,
+                grad_clip: args.grad_clip,
+            };
+            (config, tokenizer, params, 0, adam, args.batch_size, docs)
         };
-        let config = GptConfig {
-            n_layer: args.n_layer,
-            n_embd: args.n_embd,
-            block_size: args.block_size,
-            n_head: args.n_head,
-            head_dim: args.n_embd / args.n_head,
-            vocab_size: tokenizer.vocab_size(),
-            activation: args.activation,
-            no_final_norm: args.no_final_norm,
-            no_learnable_gamma: args.no_learnable_gamma,
-            dropout: args.dropout,
-        };
-        let mut params = Params::new(&config, &mut rng, args.init_scale);
-        let tok_label = match args.tokenizer_type {
-            TokenizerType::Char => "char",
-            TokenizerType::Bpe => "bpe",
-        };
-        println!(
-            "docs: {} | vocab: {} ({}) | params: {} | layers: {} | embd: {} | heads: {}",
-            docs.len(),
-            tokenizer.vocab_size(),
-            tok_label,
-            params.len(),
-            config.n_layer,
-            config.n_embd,
-            config.n_head
-        );
+
+    // Training (skipped when --steps 0)
+    if args.steps > 0 {
+        let mut docs = docs;
 
         // Split into train/val
         let val_count = (docs.len() as f64 * args.val_split) as usize;
         let val_docs: Vec<String> = docs.drain(docs.len() - val_count..).collect();
         let train_docs = docs;
 
-        // Training
-        let adam = AdamConfig {
-            lr: args.lr,
-            beta1: args.beta1,
-            beta2: args.beta2,
-            eps: 1e-8,
-            weight_decay: args.weight_decay,
-            warmup_steps: args.warmup,
-            schedule: args.lr_schedule,
-            grad_clip: args.grad_clip,
-        };
         let model = GptModel::build(&config);
         let nt = n_trainable(&config, params.len());
         let mut grads_buf = vec![0.0; nt];
         let mut recent_losses = VecDeque::with_capacity(101);
         let train_start = Instant::now();
-        let mut last_print = Instant::now() - Duration::from_secs(2); // ensure first print
+        let mut last_print = Instant::now() - Duration::from_secs(2);
         let mut doc_idx = 0usize;
-        let batch_size = args.batch_size;
         let train_len = train_docs.len();
         let mut train_order: Vec<usize> = (0..train_len).collect();
-        // Track epoch boundary for re-shuffling and val loss
         let mut docs_seen = 0usize;
         let mut epoch = 0usize;
 
-        for step in 0..args.steps {
-            // Zero gradient buffer
+        // Total steps for LR schedule: previous + new
+        let total_steps = step_offset + args.steps;
+
+        for i in 0..args.steps {
+            let step = step_offset + i;
+
             for g in grads_buf.iter_mut() {
                 *g = 0.0;
             }
 
             let mut batch_loss = 0.0;
             for _ in 0..batch_size {
-                // Epoch-based re-shuffling
                 if docs_seen > 0 && docs_seen.is_multiple_of(train_len) {
                     epoch += 1;
-                    // Fisher-Yates shuffle
-                    for i in (1..train_len).rev() {
-                        let j = rng.random_range(0..=i);
-                        train_order.swap(i, j);
+                    for k in (1..train_len).rev() {
+                        let j = rng.random_range(0..=k);
+                        train_order.swap(k, j);
                     }
-                    // Validation loss at epoch boundary
                     if !val_docs.is_empty() {
                         let vl = compute_val_loss(&params, &config, &tokenizer, &val_docs);
                         println!("\nepoch {} | val_loss {:.4}", epoch, vl);
@@ -597,14 +624,14 @@ fn main() {
                 batch_loss +=
                     forward_backward(&params, &config, &model, &tokens, &mut grads_buf, &mut rng);
             }
-            // Average gradients and loss
+
             let inv_batch = 1.0 / batch_size as f64;
             for g in grads_buf.iter_mut() {
                 *g *= inv_batch;
             }
             batch_loss *= inv_batch;
 
-            adamw_step(&mut params, &config, &adam, &grads_buf, step, args.steps);
+            adamw_step(&mut params, &config, &adam, &grads_buf, step, total_steps);
 
             recent_losses.push_back(batch_loss);
             if recent_losses.len() > 100 {
@@ -612,11 +639,10 @@ fn main() {
             }
             let avg: f64 = recent_losses.iter().sum::<f64>() / recent_losses.len() as f64;
             let now = Instant::now();
-            if now.duration_since(last_print) >= Duration::from_secs(1) || step + 1 == args.steps {
+            if now.duration_since(last_print) >= Duration::from_secs(1) || i + 1 == args.steps {
                 last_print = now;
                 let elapsed = train_start.elapsed().as_secs_f64();
-                let steps_done = step + 1;
-                // Show ETA only after enough steps for a reliable estimate
+                let steps_done = i + 1;
                 let eta_str = if steps_done >= 10 {
                     let secs_per_step = elapsed / steps_done as f64;
                     let remaining = ((args.steps - steps_done) as f64 * secs_per_step) as u64;
@@ -626,8 +652,8 @@ fn main() {
                 };
                 print!(
                     "\rstep {:4} / {:4} | loss {:.4} | avg100 {:.4}{}",
-                    steps_done,
-                    args.steps,
+                    step + 1,
+                    total_steps,
                     batch_loss,
                     avg,
                     eta_str
@@ -637,18 +663,23 @@ fn main() {
         }
         println!();
 
-        // Final val loss
         if !val_docs.is_empty() {
             let vl = compute_val_loss(&params, &config, &tokenizer, &val_docs);
             println!("final val_loss {:.4}", vl);
         }
 
         if let Some(ref path) = args.save {
-            save_checkpoint(path, &config, &tokenizer, &params);
+            save_checkpoint(
+                path,
+                &config,
+                &tokenizer,
+                &params,
+                step_offset + args.steps,
+                &adam,
+                batch_size,
+            );
         }
-
-        (config, tokenizer, params)
-    };
+    }
 
     // Inference
     println!("--- generated samples ---");

@@ -1204,7 +1204,24 @@ pub fn generate_sample(
 pub const CHECKPOINT_MAGIC: &[u8; 4] = b"MGPT";
 pub const CHECKPOINT_VERSION: u64 = 1;
 
-pub fn save_checkpoint(path: &str, config: &GptConfig, tokenizer: &Tokenizer, params: &Params) {
+pub struct Checkpoint {
+    pub config: GptConfig,
+    pub tokenizer: Tokenizer,
+    pub params: Params,
+    pub completed_step: usize,
+    pub adam: AdamConfig,
+    pub batch_size: usize,
+}
+
+pub fn save_checkpoint(
+    path: &str,
+    config: &GptConfig,
+    tokenizer: &Tokenizer,
+    params: &Params,
+    completed_step: usize,
+    adam: &AdamConfig,
+    batch_size: usize,
+) {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(CHECKPOINT_MAGIC);
     for &v in &[
@@ -1250,11 +1267,38 @@ pub fn save_checkpoint(path: &str, config: &GptConfig, tokenizer: &Tokenizer, pa
             }
         }
     }
-    // Params
+    // Params (weights)
     buf.extend_from_slice(&(params.data.len() as u64).to_le_bytes());
     for &v in &params.data {
         buf.extend_from_slice(&v.to_le_bytes());
     }
+    // Training state: completed step
+    buf.extend_from_slice(&(completed_step as u64).to_le_bytes());
+    // Optimizer state: m and v buffers
+    for &v in &params.m {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for &v in &params.v {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    // Training hyperparameters
+    for &v in &[
+        adam.lr,
+        adam.beta1,
+        adam.beta2,
+        adam.weight_decay,
+        adam.grad_clip,
+    ] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf.extend_from_slice(&(adam.warmup_steps as u64).to_le_bytes());
+    buf.push(match adam.schedule {
+        LrSchedule::Cosine => 0,
+        LrSchedule::Linear => 1,
+    });
+    buf.extend_from_slice(&config.dropout.to_le_bytes());
+    buf.extend_from_slice(&(batch_size as u64).to_le_bytes());
+
     fs::write(path, &buf).unwrap_or_else(|e| panic!("failed to save {path}: {e}"));
     println!("saved checkpoint to {path} ({} bytes)", buf.len());
 }
@@ -1281,7 +1325,7 @@ pub fn read_u32(data: &[u8], pos: &mut usize, path: &str) -> u32 {
     u32::from_le_bytes(read_bytes(data, pos, 4, path).try_into().unwrap())
 }
 
-pub fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
+pub fn load_checkpoint(path: &str) -> Checkpoint {
     let data = fs::read(path).unwrap_or_else(|e| {
         eprintln!("error: failed to read '{path}': {e}");
         std::process::exit(1);
@@ -1381,20 +1425,8 @@ pub fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
     };
 
     let vocab_size = tokenizer.vocab_size();
-    let config = GptConfig {
-        n_layer,
-        n_embd,
-        block_size,
-        n_head,
-        head_dim: n_embd / n_head,
-        vocab_size,
-        activation,
-        no_final_norm,
-        no_learnable_gamma,
-        dropout: 0.0,
-    };
 
-    // Params
+    // Params (weights)
     let n_params = read_u64(&data, &mut pos, path) as usize;
 
     // Validate n_params matches config expectations
@@ -1416,10 +1448,67 @@ pub fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
     for _ in 0..n_params {
         param_data.push(read_f64(&data, &mut pos, path));
     }
+
+    // Training state
+    let completed_step = read_u64(&data, &mut pos, path) as usize;
+
+    // Optimizer state: m and v buffers
+    let mut m = Vec::with_capacity(n_params);
+    for _ in 0..n_params {
+        m.push(read_f64(&data, &mut pos, path));
+    }
+    let mut v = Vec::with_capacity(n_params);
+    for _ in 0..n_params {
+        v.push(read_f64(&data, &mut pos, path));
+    }
+
     let params = Params {
         data: param_data,
-        m: vec![0.0; n_params],
-        v: vec![0.0; n_params],
+        m,
+        v,
+    };
+
+    // Training hyperparameters
+    let lr = read_f64(&data, &mut pos, path);
+    let beta1 = read_f64(&data, &mut pos, path);
+    let beta2 = read_f64(&data, &mut pos, path);
+    let weight_decay = read_f64(&data, &mut pos, path);
+    let grad_clip = read_f64(&data, &mut pos, path);
+    let warmup_steps = read_u64(&data, &mut pos, path) as usize;
+    let schedule_byte = read_bytes(&data, &mut pos, 1, path)[0];
+    let schedule = match schedule_byte {
+        0 => LrSchedule::Cosine,
+        1 => LrSchedule::Linear,
+        _ => {
+            eprintln!("error: unknown lr_schedule {schedule_byte} in checkpoint '{path}'");
+            std::process::exit(1);
+        }
+    };
+    let dropout = read_f64(&data, &mut pos, path);
+    let batch_size = read_u64(&data, &mut pos, path) as usize;
+
+    let adam = AdamConfig {
+        lr,
+        beta1,
+        beta2,
+        eps: 1e-8,
+        weight_decay,
+        warmup_steps,
+        schedule,
+        grad_clip,
+    };
+
+    let config = GptConfig {
+        n_layer,
+        n_embd,
+        block_size,
+        n_head,
+        head_dim: n_embd / n_head,
+        vocab_size,
+        activation,
+        no_final_norm,
+        no_learnable_gamma,
+        dropout,
     };
 
     let tok_label = match tokenizer {
@@ -1427,11 +1516,18 @@ pub fn load_checkpoint(path: &str) -> (GptConfig, Tokenizer, Params) {
         Tokenizer::Bpe(_) => "bpe",
     };
     println!(
-        "loaded checkpoint from {path}: layers={} embd={} heads={} params={} tokenizer={}",
-        n_layer, n_embd, n_head, n_params, tok_label
+        "loaded checkpoint from {path}: layers={} embd={} heads={} params={} tokenizer={} step={}",
+        n_layer, n_embd, n_head, n_params, tok_label, completed_step
     );
 
-    (config, tokenizer, params)
+    Checkpoint {
+        config,
+        tokenizer,
+        params,
+        completed_step,
+        adam,
+        batch_size,
+    }
 }
 
 pub fn compute_val_loss(
