@@ -136,7 +136,15 @@ fn test_checkpoint_roundtrip() {
         grad_clip: 0.0,
     };
 
-    save_checkpoint(path_str, &config, &tokenizer, &params, 42, &adam, 1);
+    let ckpt_save = Checkpoint {
+        config: config.clone(),
+        tokenizer: tokenizer.clone(),
+        params: params.clone(),
+        completed_step: 42,
+        adam: adam.clone(),
+        batch_size: 1,
+    };
+    save_checkpoint(path_str, &ckpt_save);
     let ckpt = load_checkpoint(path_str);
 
     // Config
@@ -273,7 +281,15 @@ fn test_bpe_checkpoint_roundtrip() {
         grad_clip: 0.0,
     };
 
-    save_checkpoint(path_str, &config, &tokenizer, &params, 0, &adam, 1);
+    let ckpt_save = Checkpoint {
+        config: config.clone(),
+        tokenizer: tokenizer.clone(),
+        params: params.clone(),
+        completed_step: 0,
+        adam,
+        batch_size: 1,
+    };
+    save_checkpoint(path_str, &ckpt_save);
     let ckpt = load_checkpoint(path_str);
 
     assert_eq!(config.n_layer, ckpt.config.n_layer);

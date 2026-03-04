@@ -669,15 +669,15 @@ fn main() {
         }
 
         if let Some(ref path) = args.save {
-            save_checkpoint(
-                path,
-                &config,
-                &tokenizer,
-                &params,
-                step_offset + args.steps,
-                &adam,
+            let ckpt = Checkpoint {
+                config: config.clone(),
+                tokenizer: tokenizer.clone(),
+                params: params.clone(),
+                completed_step: step_offset + args.steps,
+                adam: adam.clone(),
                 batch_size,
-            );
+            };
+            save_checkpoint(path, &ckpt);
         }
     }
 

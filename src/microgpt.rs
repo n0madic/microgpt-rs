@@ -6,6 +6,7 @@
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand_distr::StandardNormal;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 
@@ -212,17 +213,20 @@ impl Tape {
 // Section 2: Tokenizer — char-level and BPE with BOS token
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct CharTokenizer {
     pub chars: Vec<char>,
     pub char_to_id: HashMap<char, usize>,
 }
 
+#[derive(Clone)]
 pub struct BpeTokenizer {
     pub vocab: Vec<String>,
     pub token_to_id: HashMap<String, usize>,
     pub merges: Vec<(usize, usize)>,
 }
 
+#[derive(Clone)]
 pub enum Tokenizer {
     Char(CharTokenizer),
     Bpe(BpeTokenizer),
@@ -390,13 +394,13 @@ impl Tokenizer {
 // Section 3: Model Config & Parameters
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Activation {
     Silu,
     Relu,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LrSchedule {
     Cosine,
     Linear,
@@ -414,6 +418,7 @@ pub enum InitScale {
     Scaled,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GptConfig {
     pub n_layer: usize,
     pub n_embd: usize,
@@ -464,6 +469,7 @@ impl GptConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Params {
     pub data: Vec<f64>,
     pub m: Vec<f64>,
@@ -846,6 +852,7 @@ pub fn gpt_forward(
 // Section 6: Training — AdamW optimizer with cosine LR & gradient clipping
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdamConfig {
     pub lr: f64,
     pub beta1: f64,
@@ -1198,11 +1205,10 @@ pub fn generate_sample(
 }
 
 // ---------------------------------------------------------------------------
-// Section 9: Model checkpoint — save/load
+// Section 9: Model checkpoint — save/load (MessagePack via serde + rmp-serde)
 // ---------------------------------------------------------------------------
 
-pub const CHECKPOINT_MAGIC: &[u8; 4] = b"MGPT";
-pub const CHECKPOINT_VERSION: u64 = 1;
+const CHECKPOINT_MAGIC: &[u8; 4] = b"MGPT";
 
 pub struct Checkpoint {
     pub config: GptConfig,
@@ -1213,302 +1219,105 @@ pub struct Checkpoint {
     pub batch_size: usize,
 }
 
-pub fn save_checkpoint(
-    path: &str,
-    config: &GptConfig,
-    tokenizer: &Tokenizer,
-    params: &Params,
-    completed_step: usize,
-    adam: &AdamConfig,
-    batch_size: usize,
-) {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(CHECKPOINT_MAGIC);
-    for &v in &[
-        CHECKPOINT_VERSION,
-        config.n_layer as u64,
-        config.n_embd as u64,
-        config.n_head as u64,
-        config.block_size as u64,
-    ] {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    // Architectural flags
-    buf.push(match config.activation {
-        Activation::Silu => 0,
-        Activation::Relu => 1,
-    });
-    buf.push(config.no_final_norm as u8);
-    buf.push(config.no_learnable_gamma as u8);
-    // Tokenizer type + data
-    match tokenizer {
-        Tokenizer::Char(ct) => {
-            buf.push(0u8);
-            buf.extend_from_slice(&(ct.chars.len() as u64).to_le_bytes());
-            for &ch in &ct.chars {
-                let mut utf8_buf = [0u8; 4];
-                let encoded = ch.encode_utf8(&mut utf8_buf);
-                buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                buf.extend_from_slice(encoded.as_bytes());
-            }
-        }
-        Tokenizer::Bpe(bt) => {
-            buf.push(1u8);
-            buf.extend_from_slice(&(bt.vocab.len() as u64).to_le_bytes());
-            for token_str in &bt.vocab {
-                let bytes = token_str.as_bytes();
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(bytes);
-            }
-            buf.extend_from_slice(&(bt.merges.len() as u64).to_le_bytes());
-            for &(a, b) in &bt.merges {
-                buf.extend_from_slice(&(a as u64).to_le_bytes());
-                buf.extend_from_slice(&(b as u64).to_le_bytes());
-            }
-        }
-    }
-    // Params (weights)
-    buf.extend_from_slice(&(params.data.len() as u64).to_le_bytes());
-    for &v in &params.data {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    // Training state: completed step
-    buf.extend_from_slice(&(completed_step as u64).to_le_bytes());
-    // Optimizer state: m and v buffers
-    for &v in &params.m {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for &v in &params.v {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    // Training hyperparameters
-    for &v in &[
-        adam.lr,
-        adam.beta1,
-        adam.beta2,
-        adam.weight_decay,
-        adam.grad_clip,
-    ] {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf.extend_from_slice(&(adam.warmup_steps as u64).to_le_bytes());
-    buf.push(match adam.schedule {
-        LrSchedule::Cosine => 0,
-        LrSchedule::Linear => 1,
-    });
-    buf.extend_from_slice(&config.dropout.to_le_bytes());
-    buf.extend_from_slice(&(batch_size as u64).to_le_bytes());
+#[derive(Serialize, Deserialize)]
+enum TokenizerData {
+    Char {
+        chars: Vec<char>,
+    },
+    Bpe {
+        vocab: Vec<String>,
+        merges: Vec<(usize, usize)>,
+    },
+}
 
+impl TokenizerData {
+    fn from_tokenizer(tok: &Tokenizer) -> Self {
+        match tok {
+            Tokenizer::Char(ct) => TokenizerData::Char {
+                chars: ct.chars.clone(),
+            },
+            Tokenizer::Bpe(bt) => TokenizerData::Bpe {
+                vocab: bt.vocab.clone(),
+                merges: bt.merges.clone(),
+            },
+        }
+    }
+
+    fn into_tokenizer(self) -> Tokenizer {
+        match self {
+            TokenizerData::Char { chars } => {
+                let char_to_id = chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+                Tokenizer::Char(CharTokenizer { chars, char_to_id })
+            }
+            TokenizerData::Bpe { vocab, merges } => {
+                let token_to_id = vocab
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.clone(), i))
+                    .collect();
+                Tokenizer::Bpe(BpeTokenizer {
+                    vocab,
+                    token_to_id,
+                    merges,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckpointData {
+    config: GptConfig,
+    adam: AdamConfig,
+    tokenizer: TokenizerData,
+    params_data: Vec<f64>,
+    params_m: Vec<f64>,
+    params_v: Vec<f64>,
+    completed_step: usize,
+    batch_size: usize,
+}
+
+pub fn save_checkpoint(path: &str, ckpt: &Checkpoint) {
+    let data = CheckpointData {
+        config: ckpt.config.clone(),
+        adam: ckpt.adam.clone(),
+        tokenizer: TokenizerData::from_tokenizer(&ckpt.tokenizer),
+        params_data: ckpt.params.data.clone(),
+        params_m: ckpt.params.m.clone(),
+        params_v: ckpt.params.v.clone(),
+        completed_step: ckpt.completed_step,
+        batch_size: ckpt.batch_size,
+    };
+    let mut buf = CHECKPOINT_MAGIC.to_vec();
+    buf.extend(rmp_serde::to_vec_named(&data).expect("failed to serialize checkpoint"));
     fs::write(path, &buf).unwrap_or_else(|e| panic!("failed to save {path}: {e}"));
     println!("saved checkpoint to {path} ({} bytes)", buf.len());
 }
 
-pub fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize, path: &str) -> &'a [u8] {
-    if *pos + n > data.len() {
-        eprintln!("error: checkpoint '{path}' is truncated at offset {}", *pos);
-        std::process::exit(1);
-    }
-    let slice = &data[*pos..*pos + n];
-    *pos += n;
-    slice
-}
-
-pub fn read_u64(data: &[u8], pos: &mut usize, path: &str) -> u64 {
-    u64::from_le_bytes(read_bytes(data, pos, 8, path).try_into().unwrap())
-}
-
-pub fn read_f64(data: &[u8], pos: &mut usize, path: &str) -> f64 {
-    f64::from_le_bytes(read_bytes(data, pos, 8, path).try_into().unwrap())
-}
-
-pub fn read_u32(data: &[u8], pos: &mut usize, path: &str) -> u32 {
-    u32::from_le_bytes(read_bytes(data, pos, 4, path).try_into().unwrap())
-}
-
 pub fn load_checkpoint(path: &str) -> Checkpoint {
-    let data = fs::read(path).unwrap_or_else(|e| {
+    let raw = fs::read(path).unwrap_or_else(|e| {
         eprintln!("error: failed to read '{path}': {e}");
         std::process::exit(1);
     });
-    let mut pos = 0;
-
-    // Magic
-    let magic = read_bytes(&data, &mut pos, 4, path);
-    if magic != CHECKPOINT_MAGIC {
+    if raw.len() < 4 || &raw[..4] != CHECKPOINT_MAGIC {
         eprintln!("error: '{path}' is not a valid checkpoint (bad magic)");
         std::process::exit(1);
     }
-
-    let version = read_u64(&data, &mut pos, path);
-    if version != CHECKPOINT_VERSION {
-        eprintln!("error: unsupported checkpoint version {version} in '{path}'");
+    let data: CheckpointData = rmp_serde::from_slice(&raw[4..]).unwrap_or_else(|e| {
+        eprintln!("error: failed to deserialize checkpoint '{path}': {e}");
         std::process::exit(1);
-    }
-    let n_layer = read_u64(&data, &mut pos, path) as usize;
-    let n_embd = read_u64(&data, &mut pos, path) as usize;
-    let n_head = read_u64(&data, &mut pos, path) as usize;
-    let block_size = read_u64(&data, &mut pos, path) as usize;
+    });
 
-    if n_head == 0 {
-        eprintln!("error: checkpoint '{path}' has n_head=0");
-        std::process::exit(1);
-    }
-
-    // Architectural flags
-    let act_byte = read_bytes(&data, &mut pos, 1, path)[0];
-    let activation = match act_byte {
-        0 => Activation::Silu,
-        1 => Activation::Relu,
-        _ => {
-            eprintln!("error: unknown activation {act_byte} in checkpoint '{path}'");
-            std::process::exit(1);
-        }
-    };
-    let no_final_norm = read_bytes(&data, &mut pos, 1, path)[0] != 0;
-    let no_learnable_gamma = read_bytes(&data, &mut pos, 1, path)[0] != 0;
-
-    // Tokenizer
-    let tok_type = read_bytes(&data, &mut pos, 1, path)[0];
-    let tokenizer = match tok_type {
-        0 => {
-            // Char tokenizer
-            let n_chars = read_u64(&data, &mut pos, path) as usize;
-            let mut chars = Vec::with_capacity(n_chars);
-            for _ in 0..n_chars {
-                let len = read_u32(&data, &mut pos, path) as usize;
-                let bytes = read_bytes(&data, &mut pos, len, path);
-                let s = std::str::from_utf8(bytes).unwrap_or_else(|_| {
-                    eprintln!("error: invalid utf8 in checkpoint '{path}'");
-                    std::process::exit(1);
-                });
-                chars.push(s.chars().next().unwrap());
-            }
-            let char_to_id: HashMap<char, usize> =
-                chars.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-            Tokenizer::Char(CharTokenizer { chars, char_to_id })
-        }
-        1 => {
-            // BPE tokenizer
-            let n_tokens = read_u64(&data, &mut pos, path) as usize;
-            let mut vocab = Vec::with_capacity(n_tokens);
-            for _ in 0..n_tokens {
-                let len = read_u32(&data, &mut pos, path) as usize;
-                let bytes = read_bytes(&data, &mut pos, len, path);
-                let s = std::str::from_utf8(bytes).unwrap_or_else(|_| {
-                    eprintln!("error: invalid utf8 in checkpoint '{path}'");
-                    std::process::exit(1);
-                });
-                vocab.push(s.to_string());
-            }
-            let n_merges = read_u64(&data, &mut pos, path) as usize;
-            let mut merges = Vec::with_capacity(n_merges);
-            for _ in 0..n_merges {
-                let a = read_u64(&data, &mut pos, path) as usize;
-                let b = read_u64(&data, &mut pos, path) as usize;
-                merges.push((a, b));
-            }
-            let token_to_id: HashMap<String, usize> = vocab
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (s.clone(), i))
-                .collect();
-            Tokenizer::Bpe(BpeTokenizer {
-                vocab,
-                token_to_id,
-                merges,
-            })
-        }
-        _ => {
-            eprintln!("error: unknown tokenizer type {tok_type} in checkpoint '{path}'");
-            std::process::exit(1);
-        }
-    };
-
-    let vocab_size = tokenizer.vocab_size();
-
-    // Params (weights)
-    let n_params = read_u64(&data, &mut pos, path) as usize;
-
-    // Validate n_params matches config expectations
-    let e = n_embd;
-    let expected_params = vocab_size * e
-        + block_size * e
-        + vocab_size * e
-        + n_layer * (4 * e * e + 4 * e * e + e * 4 * e)
-        + (2 + 2 * n_layer) * e;
-    if n_params != expected_params {
-        eprintln!(
-            "error: checkpoint '{path}' has {} params but config expects {}",
-            n_params, expected_params
-        );
-        std::process::exit(1);
-    }
-
-    let mut param_data = Vec::with_capacity(n_params);
-    for _ in 0..n_params {
-        param_data.push(read_f64(&data, &mut pos, path));
-    }
-
-    // Training state
-    let completed_step = read_u64(&data, &mut pos, path) as usize;
-
-    // Optimizer state: m and v buffers
-    let mut m = Vec::with_capacity(n_params);
-    for _ in 0..n_params {
-        m.push(read_f64(&data, &mut pos, path));
-    }
-    let mut v = Vec::with_capacity(n_params);
-    for _ in 0..n_params {
-        v.push(read_f64(&data, &mut pos, path));
-    }
+    let tokenizer = data.tokenizer.into_tokenizer();
+    // Recompute derived fields
+    let mut config = data.config;
+    config.head_dim = config.n_embd / config.n_head;
+    config.vocab_size = tokenizer.vocab_size();
 
     let params = Params {
-        data: param_data,
-        m,
-        v,
-    };
-
-    // Training hyperparameters
-    let lr = read_f64(&data, &mut pos, path);
-    let beta1 = read_f64(&data, &mut pos, path);
-    let beta2 = read_f64(&data, &mut pos, path);
-    let weight_decay = read_f64(&data, &mut pos, path);
-    let grad_clip = read_f64(&data, &mut pos, path);
-    let warmup_steps = read_u64(&data, &mut pos, path) as usize;
-    let schedule_byte = read_bytes(&data, &mut pos, 1, path)[0];
-    let schedule = match schedule_byte {
-        0 => LrSchedule::Cosine,
-        1 => LrSchedule::Linear,
-        _ => {
-            eprintln!("error: unknown lr_schedule {schedule_byte} in checkpoint '{path}'");
-            std::process::exit(1);
-        }
-    };
-    let dropout = read_f64(&data, &mut pos, path);
-    let batch_size = read_u64(&data, &mut pos, path) as usize;
-
-    let adam = AdamConfig {
-        lr,
-        beta1,
-        beta2,
-        eps: 1e-8,
-        weight_decay,
-        warmup_steps,
-        schedule,
-        grad_clip,
-    };
-
-    let config = GptConfig {
-        n_layer,
-        n_embd,
-        block_size,
-        n_head,
-        head_dim: n_embd / n_head,
-        vocab_size,
-        activation,
-        no_final_norm,
-        no_learnable_gamma,
-        dropout,
+        data: data.params_data,
+        m: data.params_m,
+        v: data.params_v,
     };
 
     let tok_label = match tokenizer {
@@ -1517,16 +1326,21 @@ pub fn load_checkpoint(path: &str) -> Checkpoint {
     };
     println!(
         "loaded checkpoint from {path}: layers={} embd={} heads={} params={} tokenizer={} step={}",
-        n_layer, n_embd, n_head, n_params, tok_label, completed_step
+        config.n_layer,
+        config.n_embd,
+        config.n_head,
+        params.data.len(),
+        tok_label,
+        data.completed_step
     );
 
     Checkpoint {
         config,
         tokenizer,
         params,
-        completed_step,
-        adam,
-        batch_size,
+        completed_step: data.completed_step,
+        adam: data.adam,
+        batch_size: data.batch_size,
     }
 }
 
