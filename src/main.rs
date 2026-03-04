@@ -11,6 +11,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
 use std::fs;
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Section 8: Data Loading & Main
@@ -471,6 +473,16 @@ impl Default for Args {
     }
 }
 
+fn fmt_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 fn main() {
     let args = parse_args();
     let seed = args.seed.unwrap_or_else(|| {
@@ -545,6 +557,8 @@ fn main() {
         let nt = n_trainable(&config, params.len());
         let mut grads_buf = vec![0.0; nt];
         let mut recent_losses = VecDeque::with_capacity(101);
+        let train_start = Instant::now();
+        let mut last_print = Instant::now() - Duration::from_secs(2); // ensure first print
         let mut doc_idx = 0usize;
         let batch_size = args.batch_size;
         let train_len = train_docs.len();
@@ -597,13 +611,29 @@ fn main() {
                 recent_losses.pop_front();
             }
             let avg: f64 = recent_losses.iter().sum::<f64>() / recent_losses.len() as f64;
-            print!(
-                "\rstep {:4} / {:4} | loss {:.4} | avg100 {:.4}",
-                step + 1,
-                args.steps,
-                batch_loss,
-                avg
-            );
+            let now = Instant::now();
+            if now.duration_since(last_print) >= Duration::from_secs(1) || step + 1 == args.steps {
+                last_print = now;
+                let elapsed = train_start.elapsed().as_secs_f64();
+                let steps_done = step + 1;
+                // Show ETA only after enough steps for a reliable estimate
+                let eta_str = if steps_done >= 10 {
+                    let secs_per_step = elapsed / steps_done as f64;
+                    let remaining = ((args.steps - steps_done) as f64 * secs_per_step) as u64;
+                    format!(" | eta {}", fmt_duration(remaining))
+                } else {
+                    String::new()
+                };
+                print!(
+                    "\rstep {:4} / {:4} | loss {:.4} | avg100 {:.4}{}",
+                    steps_done,
+                    args.steps,
+                    batch_loss,
+                    avg,
+                    eta_str
+                );
+                let _ = io::stdout().flush();
+            }
         }
         println!();
 
@@ -622,9 +652,9 @@ fn main() {
 
     // Inference
     println!("--- generated samples ---");
-    for i in 0..args.samples {
+    for _ in 0..args.samples {
         let name = generate_sample(&params, &config, &tokenizer, args.temperature, &mut rng);
-        println!("sample {:2}: {}", i + 1, name);
+        println!("{}", name);
     }
 }
 
