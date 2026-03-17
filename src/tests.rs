@@ -724,6 +724,122 @@ fn test_swiglu_checkpoint_roundtrip() {
     let _ = std::fs::remove_file(path_str);
 }
 
+// --- (k3) SwiGLU: tape forward matches f64 inference ---
+
+#[test]
+fn test_swiglu_tape_matches_f64() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abcabc".to_string(), "defdef".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::SwiGLU,
+        no_final_norm: false,
+        no_learnable_gamma: false,
+        dropout: 0.0,
+    };
+    let params = Params::new(&config, &mut rng, InitScale::Flat);
+    let model = GptModel::build(&config);
+    let tokens = tokenizer.encode(&docs[0]);
+    let token_id = tokens[0];
+
+    // Tape forward
+    let mut tape = Tape::with_capacity(config.estimate_tape_nodes());
+    tape.load_params(&params.data);
+    let c = TapeConstants::new(&mut tape, config.n_embd);
+    let mut keys_tape: Vec<Vec<Vec<Idx>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
+    let mut vals_tape: Vec<Vec<Vec<Idx>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
+    let logits_tape = gpt_forward(
+        &mut tape, &model, &config, &c, token_id, 0,
+        &mut keys_tape, &mut vals_tape, &mut rng,
+    );
+    let tape_vals: Vec<f64> = logits_tape.iter().map(|&idx| tape.val(idx)).collect();
+
+    // f64 forward
+    let mut keys_f64: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
+    let mut vals_f64: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
+    let logits_f64 = gpt_forward_f64(
+        &params.data, &config, token_id, 0,
+        &mut keys_f64, &mut vals_f64,
+    );
+
+    assert_eq!(tape_vals.len(), logits_f64.len());
+    for (i, (&a, &b)) in tape_vals.iter().zip(logits_f64.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-10,
+            "SwiGLU tape vs f64 mismatch at logit {i}: tape={a} f64={b}"
+        );
+    }
+}
+
+// --- (k4) SwiGLU: numerical gradient check for gate path ---
+
+#[test]
+fn test_swiglu_gate_gradient_numerical() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abcabc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::SwiGLU,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let params = Params::new(&config, &mut rng, InitScale::Flat);
+    let model = GptModel::build(&config);
+    let tokens = tokenizer.encode(&docs[0]);
+
+    // Get analytical gradients via backward pass
+    let nt = n_trainable(&config, params.len());
+    let mut grads = vec![0.0; nt];
+    forward_backward(&params, &config, &model, &tokens, &mut grads, &mut rng);
+
+    // Spot-check gate weight gradients via finite differences.
+    // Gate weights start after wq+wk+wv+wo = 4*e*e attention params,
+    // offset by the global embeddings (wte + wpe + lm_head).
+    let e = config.n_embd;
+    let global_off = config.vocab_size * e + config.block_size * e + config.vocab_size * e;
+    let gate_start = global_off + 4 * e * e; // start of gate weights in layer 0
+    let h = 1e-5;
+
+    // Check a few gate weight indices
+    for &idx in &[gate_start, gate_start + 1, gate_start + 4 * e * e - 1] {
+        if idx >= nt {
+            continue;
+        }
+        let mut p_plus = params.clone();
+        p_plus.data[idx] += h;
+        let mut g_dummy = vec![0.0; nt];
+        let loss_plus = forward_backward(&p_plus, &config, &model, &tokens, &mut g_dummy, &mut rng);
+
+        let mut p_minus = params.clone();
+        p_minus.data[idx] -= h;
+        g_dummy.iter_mut().for_each(|g| *g = 0.0);
+        let loss_minus =
+            forward_backward(&p_minus, &config, &model, &tokens, &mut g_dummy, &mut rng);
+
+        let numerical = (loss_plus - loss_minus) / (2.0 * h);
+        let analytical = grads[idx];
+        let denom = analytical.abs().max(numerical.abs()).max(1e-8);
+        let rel_err = (analytical - numerical).abs() / denom;
+        assert!(
+            rel_err < 1e-4,
+            "SwiGLU gate grad mismatch at param {idx}: analytical={analytical:.8} numerical={numerical:.8} rel_err={rel_err:.6}"
+        );
+    }
+}
+
 // --- (l) AdamW step updates params, m, v ---
 
 #[test]

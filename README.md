@@ -109,7 +109,7 @@ Why each flag improves over the default:
 | `--wd 0.01` | 0 (pure Adam) | 0.01 (AdamW) | Weight decay regularizes by penalizing large weights, reducing overfitting |
 | `--grad-clip 1.0` | 0 (disabled) | 1.0 | Prevents gradient explosions that can destabilize training, especially with deeper models |
 | `--activation silu` | relu | silu | SiLU (Swish) is smooth and non-monotonic — avoids dead neurons and generally trains better than ReLU |
-| `--activation swiglu` | relu | swiglu | SwiGLU gated MLP (as in LLaMA) — adds a gate projection `SiLU(xW_gate) ⊙ xW_up` before the down projection. More params per layer but better quality |
+| `--activation swiglu` | relu | swiglu | SwiGLU gated MLP — adds a gate projection `SiLU(xW_gate) ⊙ xW_up` before the down projection. Uses the same 4×e hidden dim, so ~33% more MLP params per layer than SiLU/ReLU |
 | `--lr-schedule cosine` | linear | cosine | Cosine annealing decays slowly at first, then quickly — more time at productive learning rates |
 | `--warmup 20` | 0 | 20 | Gradual LR ramp-up prevents large early updates when Adam statistics are not yet calibrated |
 | `--init-scale scaled` | flat (0.08 std) | scaled (GPT-2 style) | Per-layer scaling (1/√depth for residual projections) prevents signal explosion in deeper models |
