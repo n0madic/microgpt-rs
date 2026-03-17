@@ -52,7 +52,7 @@ fn parse_args() -> Args {
                        --embd N        embedding dimension [default: {}]\n  \
                        --heads N       number of attention heads [default: {}]\n  \
                        --block N       context window size [default: {}]\n  \
-                       --activation S  activation function: silu, relu [default: relu]\n  \
+                       --activation S  activation function: silu, relu, swiglu [default: relu]\n  \
                        --init-scale S  weight init: flat, scaled [default: flat]\n  \
                        --no-final-norm skip final RMSNorm before lm_head (default: on)\n  \
                        --final-norm    enable final RMSNorm before lm_head\n  \
@@ -160,8 +160,9 @@ fn parse_args() -> Args {
                 args.activation = match s.as_str() {
                     "silu" => Activation::Silu,
                     "relu" => Activation::Relu,
+                    "swiglu" => Activation::SwiGLU,
                     _ => {
-                        eprintln!("error: --activation must be 'silu' or 'relu', got '{s}'");
+                        eprintln!("error: --activation must be 'silu', 'relu', or 'swiglu', got '{s}'");
                         std::process::exit(1);
                     }
                 };

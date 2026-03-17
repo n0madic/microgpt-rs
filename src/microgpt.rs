@@ -410,6 +410,7 @@ impl Tokenizer {
 pub enum Activation {
     Silu,
     Relu,
+    SwiGLU,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -445,15 +446,41 @@ pub struct GptConfig {
 }
 
 impl GptConfig {
+    /// Number of random (non-gamma) parameters per transformer layer.
+    /// SwiGLU adds an extra gate matrix (4e × e) compared to standard MLP.
+    pub fn layer_random_size(&self) -> usize {
+        let e = self.n_embd;
+        let attn = 4 * e * e; // wq + wk + wv + wo
+        let mlp = match self.activation {
+            Activation::SwiGLU => 4 * e * e + 4 * e * e + e * 4 * e, // gate + fc1(up) + fc2(down)
+            _ => 4 * e * e + e * 4 * e,                               // fc1 + fc2
+        };
+        attn + mlp
+    }
+
     pub fn estimate_tape_nodes(&self) -> usize {
         let e = self.n_embd;
         let n_params = self.vocab_size * e
             + self.block_size * e
             + self.vocab_size * e
-            + self.n_layer * (4 * e * e + 4 * e * e + e * 4 * e)
+            + self.n_layer * self.layer_random_size()
             + (2 + 2 * self.n_layer) * e;
         // Per position: embedding add + rmsnorm + per-layer (attn + mlp) + final norm + lm_head
         // Rough estimate: ~130K nodes per position for 2L/48E/8H
+        let mlp_nodes = match self.activation {
+            Activation::SwiGLU => {
+                4 * e * e + 4 * e                    // gate linear
+                + 4 * e * 6                          // silu on gate output
+                + 4 * e * e + 4 * e                  // up linear (fc1)
+                + 4 * e                              // elementwise mul (gate ⊙ up)
+                + e * 4 * e + e                      // down linear (fc2)
+            }
+            _ => {
+                4 * e * e + 4 * e                    // fc1 linear
+                + 4 * e * 6                          // silu/relu
+                + e * 4 * e + e                      // fc2 linear
+            }
+        };
         let per_pos = e                              // tok+pos add
             + 3 * e                                  // initial rmsnorm (sq + sum + mul*2 per elem)
             + self.n_layer * (
@@ -469,9 +496,7 @@ impl GptConfig {
                 + 2 * e                              // dropout (worst case: scale per elem)
                 + e                                  // residual add
                 + 3 * e                              // mlp_norm rmsnorm
-                + 4 * e * e + 4 * e                  // fc1 linear
-                + 4 * e * 6                          // silu (neg, exp, add, pow, mul per elem)
-                + e * 4 * e + e                      // fc2 linear
+                + mlp_nodes
                 + 2 * e                              // dropout
                 + e                                  // residual add
             )
@@ -492,11 +517,12 @@ impl Params {
     pub fn new(config: &GptConfig, rng: &mut StdRng, init_scale: InitScale) -> Self {
         let e = config.n_embd;
         let n_layer = config.n_layer;
+        let is_swiglu = config.activation == Activation::SwiGLU;
         // Random params: wte + wpe + lm_head + layer weights
         let n_random = config.vocab_size * e   // wte
             + config.block_size * e            // wpe
             + config.vocab_size * e            // lm_head
-            + n_layer * (4 * e * e + 4 * e * e + e * 4 * e); // layers
+            + n_layer * config.layer_random_size();
         // Gamma params (init=1.0): initial_norm + final_norm + per-layer (pre-attn + pre-mlp)
         let n_gamma = (2 + 2 * n_layer) * e;
         let n = n_random + n_gamma;
@@ -543,11 +569,17 @@ impl Params {
                     for _ in 0..e * e {
                         data.push(rng.sample::<f64, _>(StandardNormal) * residual_std);
                     }
-                    // fc1: 4*e*e — standard
+                    // SwiGLU gate: 4*e*e (only for SwiGLU)
+                    if is_swiglu {
+                        for _ in 0..4 * e * e {
+                            data.push(rng.sample::<f64, _>(StandardNormal) * qkv_std);
+                        }
+                    }
+                    // fc1 (up projection): 4*e*e
                     for _ in 0..4 * e * e {
                         data.push(rng.sample::<f64, _>(StandardNormal) * qkv_std);
                     }
-                    // fc2: e*4*e — residual projection
+                    // fc2 (down projection): e*4*e — residual projection
                     for _ in 0..e * 4 * e {
                         data.push(rng.sample::<f64, _>(StandardNormal) * residual_std);
                     }
@@ -576,6 +608,7 @@ pub struct LayerModel {
     pub attn_wk: Vec<Vec<Idx>>,
     pub attn_wv: Vec<Vec<Idx>>,
     pub attn_wo: Vec<Vec<Idx>>,
+    pub mlp_gate: Vec<Vec<Idx>>,  // SwiGLU gate projection (4e × e), empty when unused
     pub mlp_fc1: Vec<Vec<Idx>>,
     pub mlp_fc2: Vec<Vec<Idx>>,
     pub attn_norm_gamma: Vec<Idx>,
@@ -614,12 +647,18 @@ impl GptModel {
         let wpe = make_matrix(config.block_size, e);
         let lm_head = make_matrix(config.vocab_size, e);
 
+        let is_swiglu = config.activation == Activation::SwiGLU;
         let mut layers = Vec::with_capacity(config.n_layer);
         for _ in 0..config.n_layer {
             let attn_wq = make_matrix(e, e);
             let attn_wk = make_matrix(e, e);
             let attn_wv = make_matrix(e, e);
             let attn_wo = make_matrix(e, e);
+            let mlp_gate = if is_swiglu {
+                make_matrix(4 * e, e)
+            } else {
+                Vec::new()
+            };
             let mlp_fc1 = make_matrix(4 * e, e);
             let mlp_fc2 = make_matrix(e, 4 * e);
             layers.push(LayerModel {
@@ -627,6 +666,7 @@ impl GptModel {
                 attn_wk,
                 attn_wv,
                 attn_wo,
+                mlp_gate,
                 mlp_fc1,
                 mlp_fc2,
                 attn_norm_gamma: Vec::new(),
@@ -840,10 +880,25 @@ pub fn gpt_forward(
         // 2) MLP block
         let x_residual = x.clone();
         x = rmsnorm(tape, &x, &layer.mlp_norm_gamma, c);
-        x = linear(tape, &x, &layer.mlp_fc1);
         x = match config.activation {
-            Activation::Silu => x.iter().map(|&xi| silu(tape, xi, c)).collect(),
-            Activation::Relu => x.iter().map(|&xi| tape.relu(xi)).collect(),
+            Activation::SwiGLU => {
+                // SwiGLU: SiLU(x · W_gate) ⊙ (x · W_up), then W_down
+                let gate = linear(tape, &x, &layer.mlp_gate);
+                let gate: Vec<Idx> = gate.iter().map(|&gi| silu(tape, gi, c)).collect();
+                let up = linear(tape, &x, &layer.mlp_fc1);
+                gate.iter()
+                    .zip(up.iter())
+                    .map(|(&g, &u)| tape.mul(g, u))
+                    .collect()
+            }
+            Activation::Silu => {
+                let h = linear(tape, &x, &layer.mlp_fc1);
+                h.iter().map(|&xi| silu(tape, xi, c)).collect()
+            }
+            Activation::Relu => {
+                let h = linear(tape, &x, &layer.mlp_fc1);
+                h.iter().map(|&xi| tape.relu(xi)).collect()
+            }
         };
         x = linear(tape, &x, &layer.mlp_fc2);
         x = dropout(tape, &x, config.dropout, rng);
@@ -883,7 +938,7 @@ pub fn n_trainable(config: &GptConfig, n_params: usize) -> usize {
         config.vocab_size * e
             + config.block_size * e
             + config.vocab_size * e
-            + config.n_layer * (4 * e * e + 4 * e * e + e * 4 * e)
+            + config.n_layer * config.layer_random_size()
     } else {
         n_params
     }
@@ -1074,9 +1129,7 @@ pub fn gpt_forward_f64(
     let lm_head_off = off;
     off += config.vocab_size * e;
 
-    // Per-layer weight count: wq(e²) + wk(e²) + wv(e²) + wo(e²) = 4e²,
-    // fc1(4e·e) = 4e², fc2(e·4e) = 4e² → total 12e²
-    let layer_random_size = 4 * e * e + 4 * e * e + e * 4 * e;
+    let layer_random_size = config.layer_random_size();
     let layers_off = off;
     off += config.n_layer * layer_random_size;
 
@@ -1104,7 +1157,8 @@ pub fn gpt_forward_f64(
         let wk_off = wq_off + e * e;
         let wv_off = wk_off + e * e;
         let wo_off = wv_off + e * e;
-        let fc1_off = wo_off + e * e;
+        let gate_off = wo_off + e * e;
+        let fc1_off = gate_off + if config.activation == Activation::SwiGLU { 4 * e * e } else { 0 };
         let fc2_off = fc1_off + 4 * e * e;
 
         let lg_off = layer_gamma_off + li * 2 * e;
@@ -1150,7 +1204,7 @@ pub fn gpt_forward_f64(
             }
         }
 
-        x = linear_f64(&x_attn, &params[wo_off..fc1_off], e);
+        x = linear_f64(&x_attn, &params[wo_off..gate_off], e);
         for j in 0..e {
             x[j] += x_residual[j];
         }
@@ -1158,19 +1212,31 @@ pub fn gpt_forward_f64(
         // 2) MLP block
         let x_residual = x.clone();
         x = rmsnorm_f64(&x, mlp_gamma);
-        x = linear_f64(&x, &params[fc1_off..fc2_off], 4 * e);
-        match config.activation {
-            Activation::Silu => {
-                for v in &mut x {
+        x = match config.activation {
+            Activation::SwiGLU => {
+                // SwiGLU: SiLU(x · W_gate) ⊙ (x · W_up)
+                let mut gate = linear_f64(&x, &params[gate_off..fc1_off], 4 * e);
+                for v in &mut gate {
                     *v = silu_f64(*v);
                 }
+                let up = linear_f64(&x, &params[fc1_off..fc2_off], 4 * e);
+                gate.iter().zip(up.iter()).map(|(&g, &u)| g * u).collect()
+            }
+            Activation::Silu => {
+                let mut h = linear_f64(&x, &params[fc1_off..fc2_off], 4 * e);
+                for v in &mut h {
+                    *v = silu_f64(*v);
+                }
+                h
             }
             Activation::Relu => {
-                for v in &mut x {
+                let mut h = linear_f64(&x, &params[fc1_off..fc2_off], 4 * e);
+                for v in &mut h {
                     *v = relu_f64(*v);
                 }
+                h
             }
-        }
+        };
         x = linear_f64(&x, &params[fc2_off..fc2_off + e * 4 * e], e);
         for j in 0..e {
             x[j] += x_residual[j];

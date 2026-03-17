@@ -569,6 +569,161 @@ fn test_one_step_training_loss_decreases() {
     );
 }
 
+// --- (k2) SwiGLU: training loss decreases + inference produces valid tokens ---
+
+#[test]
+fn test_swiglu_training_loss_decreases() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abcabc".to_string(), "defdef".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::SwiGLU,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let mut params = Params::new(&config, &mut rng, InitScale::Flat);
+    let model = GptModel::build(&config);
+    let nt = n_trainable(&config, params.len());
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.85,
+        beta2: 0.99,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
+    let tokens = tokenizer.encode(&docs[0]);
+
+    let mut grads = vec![0.0; nt];
+    let loss0 = forward_backward(&params, &config, &model, &tokens, &mut grads, &mut rng);
+    adamw_step(&mut params, &config, &adam, &grads, 0, 100);
+
+    grads.iter_mut().for_each(|g| *g = 0.0);
+    let loss1 = forward_backward(&params, &config, &model, &tokens, &mut grads, &mut rng);
+    assert!(
+        loss1 < loss0,
+        "SwiGLU loss should decrease after one step: {loss0} -> {loss1}"
+    );
+}
+
+#[test]
+fn test_swiglu_generate_sample_valid_tokens() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abc".to_string(), "def".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::SwiGLU,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let params = Params::new(&config, &mut rng, InitScale::Flat);
+    let sample = generate_sample(&params, &config, &tokenizer, 0.5, &mut rng);
+
+    let vocab_chars: std::collections::HashSet<char> =
+        docs.iter().flat_map(|d| d.chars()).collect();
+    for ch in sample.chars() {
+        assert!(
+            vocab_chars.contains(&ch),
+            "SwiGLU generated char '{ch}' not in vocabulary"
+        );
+    }
+}
+
+#[test]
+fn test_swiglu_has_more_params_than_silu() {
+    let docs = vec!["abc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let base = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Silu,
+        no_final_norm: true,
+        no_learnable_gamma: true,
+        dropout: 0.0,
+    };
+    let swiglu_config = GptConfig {
+        activation: Activation::SwiGLU,
+        ..base.clone()
+    };
+    let mut rng1 = StdRng::seed_from_u64(42);
+    let mut rng2 = StdRng::seed_from_u64(42);
+    let silu_params = Params::new(&base, &mut rng1, InitScale::Flat);
+    let swiglu_params = Params::new(&swiglu_config, &mut rng2, InitScale::Flat);
+    // SwiGLU adds one extra gate matrix (4*e*e) per layer
+    let e = base.n_embd;
+    assert_eq!(
+        swiglu_params.len() - silu_params.len(),
+        base.n_layer * 4 * e * e,
+        "SwiGLU should have exactly 4*e*e more params per layer"
+    );
+}
+
+#[test]
+fn test_swiglu_checkpoint_roundtrip() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let docs = vec!["abc".to_string(), "bca".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::SwiGLU,
+        no_final_norm: false,
+        no_learnable_gamma: false,
+        dropout: 0.0,
+    };
+    let params = Params::new(&config, &mut rng, InitScale::Flat);
+
+    let dir = std::env::temp_dir();
+    let path = dir.join("microgpt_test_swiglu_checkpoint.mgpt");
+    let path_str = path.to_str().unwrap();
+
+    let adam = AdamConfig {
+        lr: 0.01,
+        beta1: 0.85,
+        beta2: 0.99,
+        eps: 1e-8,
+        weight_decay: 0.0,
+        warmup_steps: 0,
+        schedule: LrSchedule::Linear,
+        grad_clip: 0.0,
+    };
+
+    save_checkpoint(path_str, &config, &adam, &tokenizer, &params, 10, 1);
+    let ckpt = load_checkpoint(path_str);
+
+    assert_eq!(config.activation, ckpt.config.activation);
+    assert_eq!(params.data.len(), ckpt.params.data.len());
+    for (&a, &b) in params.data.iter().zip(ckpt.params.data.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "param mismatch: {a} vs {b}");
+    }
+
+    let _ = std::fs::remove_file(path_str);
+}
+
 // --- (l) AdamW step updates params, m, v ---
 
 #[test]

@@ -7,7 +7,7 @@ Inspired by [Karpathy's microgpt.py](https://gist.github.com/karpathy/8627fe009c
 ## What's inside
 
 - **Tape-based autograd** (Wengert list) with reverse-mode differentiation
-- **Transformer**: multi-head attention, RMSNorm (optionally with learnable gamma), SiLU or ReLU activation, optional dropout
+- **Transformer**: multi-head attention, RMSNorm (optionally with learnable gamma), SiLU/ReLU/SwiGLU activation, optional dropout
 - **AdamW** optimizer with cosine or linear LR schedule, warmup, gradient clipping, and gradient accumulation
 - **Tokenizer**: char-level (default) or BPE with configurable vocabulary size
 - **Checkpoint** save/load for trained models (architecture stored in file)
@@ -51,7 +51,7 @@ Model:
   --embd N        embedding dimension [default: 16]
   --heads N       number of attention heads [default: 4]
   --block N       context window size [default: 16]
-  --activation S  activation function: silu, relu [default: relu]
+  --activation S  activation function: silu, relu, swiglu [default: relu]
   --init-scale S  weight init: flat, scaled [default: flat]
   --no-final-norm skip final RMSNorm before lm_head (default: on)
   --final-norm    enable final RMSNorm before lm_head
@@ -109,6 +109,7 @@ Why each flag improves over the default:
 | `--wd 0.01` | 0 (pure Adam) | 0.01 (AdamW) | Weight decay regularizes by penalizing large weights, reducing overfitting |
 | `--grad-clip 1.0` | 0 (disabled) | 1.0 | Prevents gradient explosions that can destabilize training, especially with deeper models |
 | `--activation silu` | relu | silu | SiLU (Swish) is smooth and non-monotonic — avoids dead neurons and generally trains better than ReLU |
+| `--activation swiglu` | relu | swiglu | SwiGLU gated MLP (as in LLaMA) — adds a gate projection `SiLU(xW_gate) ⊙ xW_up` before the down projection. More params per layer but better quality |
 | `--lr-schedule cosine` | linear | cosine | Cosine annealing decays slowly at first, then quickly — more time at productive learning rates |
 | `--warmup 20` | 0 | 20 | Gradual LR ramp-up prevents large early updates when Adam statistics are not yet calibrated |
 | `--init-scale scaled` | flat (0.08 std) | scaled (GPT-2 style) | Per-layer scaling (1/√depth for residual projections) prevents signal explosion in deeper models |
@@ -164,7 +165,7 @@ kahar
 |-----------|---------|
 | Autograd | Tape-based (Wengert list), reverse-mode AD |
 | Normalization | RMSNorm with optional learnable per-dimension gamma |
-| Activation | ReLU (default) or SiLU, selectable via `--activation` |
+| Activation | ReLU (default), SiLU, or SwiGLU, selectable via `--activation` |
 | Dropout | Training-only, applied after attention softmax, Wo, and fc2 |
 | Loss | Fused log-softmax for numerical stability |
 | Optimizer | AdamW with decoupled weight decay (`--wd 0` for pure Adam) |
