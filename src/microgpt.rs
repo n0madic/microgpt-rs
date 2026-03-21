@@ -440,8 +440,8 @@ pub struct GptConfig {
     pub head_dim: usize,
     pub vocab_size: usize,
     pub activation: Activation,
-    pub no_final_norm: bool,
-    pub no_learnable_gamma: bool,
+    pub final_norm: bool,
+    pub learnable_gamma: bool,
     pub dropout: f64,
 }
 
@@ -456,6 +456,17 @@ impl GptConfig {
             _ => 4 * e * e + e * 4 * e,                              // fc1 + fc2
         };
         attn + mlp
+    }
+
+    /// Expected total number of parameters for this config.
+    pub fn expected_n_params(&self) -> usize {
+        let e = self.n_embd;
+        let n_random = self.vocab_size * e
+            + self.block_size * e
+            + self.vocab_size * e
+            + self.n_layer * self.layer_random_size();
+        let n_gamma = (2 + 2 * self.n_layer) * e;
+        n_random + n_gamma
     }
 
     pub fn estimate_tape_nodes(&self) -> usize {
@@ -910,7 +921,7 @@ pub fn gpt_forward(
     }
 
     // Final norm before output projection
-    if !config.no_final_norm {
+    if config.final_norm {
         x = rmsnorm(tape, &x, &model.final_norm_gamma, c);
     }
     linear(tape, &x, &model.lm_head)
@@ -933,14 +944,14 @@ pub struct AdamConfig {
 }
 
 pub fn n_trainable(config: &GptConfig, n_params: usize) -> usize {
-    if config.no_learnable_gamma {
+    if config.learnable_gamma {
+        n_params
+    } else {
         let e = config.n_embd;
         config.vocab_size * e
             + config.block_size * e
             + config.vocab_size * e
             + config.n_layer * config.layer_random_size()
-    } else {
-        n_params
     }
 }
 
@@ -1258,7 +1269,7 @@ pub fn gpt_forward_f64(
     }
 
     // Final norm + lm_head
-    if !config.no_final_norm {
+    if config.final_norm {
         x = rmsnorm_f64(&x, &params[final_norm_off..final_norm_off + e]);
     }
     linear_f64(
@@ -1430,6 +1441,16 @@ pub fn load_checkpoint(path: &str) -> Checkpoint {
         m: data.params_m,
         v: data.params_v,
     };
+
+    let expected = config.expected_n_params();
+    if params.data.len() != expected {
+        eprintln!(
+            "error: checkpoint parameter count mismatch: file has {} but config expects {}",
+            params.data.len(),
+            expected
+        );
+        std::process::exit(1);
+    }
 
     let tok_label = match tokenizer {
         Tokenizer::Char(_) => "char",

@@ -115,8 +115,8 @@ fn test_checkpoint_roundtrip() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Silu,
-        no_final_norm: false,
-        no_learnable_gamma: false,
+        final_norm: true,
+        learnable_gamma: true,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -252,8 +252,8 @@ fn test_bpe_checkpoint_roundtrip() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Silu,
-        no_final_norm: false,
-        no_learnable_gamma: false,
+        final_norm: true,
+        learnable_gamma: true,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -471,8 +471,8 @@ fn test_scaled_init_different_from_flat() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let mut rng1 = StdRng::seed_from_u64(42);
@@ -506,8 +506,8 @@ fn test_val_loss_is_finite() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let mut rng = StdRng::seed_from_u64(42);
@@ -538,8 +538,8 @@ fn test_one_step_training_loss_decreases() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let mut params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -584,8 +584,8 @@ fn test_swiglu_training_loss_decreases() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::SwiGLU,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let mut params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -628,8 +628,8 @@ fn test_swiglu_generate_sample_valid_tokens() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::SwiGLU,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -657,8 +657,8 @@ fn test_swiglu_has_more_params_than_silu() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Silu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let swiglu_config = GptConfig {
@@ -691,8 +691,8 @@ fn test_swiglu_checkpoint_roundtrip() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::SwiGLU,
-        no_final_norm: false,
-        no_learnable_gamma: false,
+        final_norm: true,
+        learnable_gamma: true,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -739,8 +739,8 @@ fn test_swiglu_tape_matches_f64() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::SwiGLU,
-        no_final_norm: false,
-        no_learnable_gamma: false,
+        final_norm: true,
+        learnable_gamma: true,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -792,8 +792,8 @@ fn test_swiglu_gate_gradient_numerical() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::SwiGLU,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -870,8 +870,8 @@ fn test_adamw_step_updates_params() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let mut params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -921,8 +921,8 @@ fn test_lr_schedule_values() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let base_params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -972,8 +972,8 @@ fn test_generate_sample_valid_tokens() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let params = Params::new(&config, &mut rng, InitScale::Flat);
@@ -1032,8 +1032,8 @@ fn test_val_loss_with_short_doc() {
         head_dim: 2,
         vocab_size: tokenizer.vocab_size(),
         activation: Activation::Relu,
-        no_final_norm: true,
-        no_learnable_gamma: true,
+        final_norm: false,
+        learnable_gamma: false,
         dropout: 0.0,
     };
     let mut rng = StdRng::seed_from_u64(42);

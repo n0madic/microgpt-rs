@@ -206,4 +206,4 @@ Training and inference are optimized without sacrificing correctness:
 
 ## Checkpoint format
 
-Binary file (`.mgpt`) using MessagePack serialization: magic header (`MGPT`) + model config + optimizer config (AdamW hyperparameters) + tokenizer (char vocabulary or BPE vocabulary with merge rules) + model parameters + optimizer state (Adam m/v vectors) + training progress (completed step, batch size). Full architecture and training state are stored in the file, so `--load` doesn't need any model flags and can resume training seamlessly.
+Binary file (`.mgpt`) using MessagePack serialization: magic header (`MGPT`) + model config + optimizer config (AdamW hyperparameters) + tokenizer (char vocabulary or BPE vocabulary with merge rules) + model parameters + optimizer state (Adam m/v vectors) + training progress (completed step, batch size). Full architecture and training state are stored in the file, so `--load` doesn't need any model flags and can resume training seamlessly. On load, the parameter count is validated against the config to catch corrupted or incompatible checkpoints early.

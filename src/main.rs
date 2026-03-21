@@ -168,16 +168,16 @@ fn parse_args() -> Args {
                 };
             }
             "--no-final-norm" => {
-                args.no_final_norm = true;
+                args.final_norm = false;
             }
             "--final-norm" => {
-                args.no_final_norm = false;
+                args.final_norm = true;
             }
             "--no-learnable-gamma" => {
-                args.no_learnable_gamma = true;
+                args.learnable_gamma = false;
             }
             "--learnable-gamma" => {
-                args.no_learnable_gamma = false;
+                args.learnable_gamma = true;
             }
             "--beta2" => {
                 i += 1;
@@ -426,8 +426,8 @@ struct Args {
     grad_clip: f64,
     lr_schedule: LrSchedule,
     activation: Activation,
-    no_final_norm: bool,
-    no_learnable_gamma: bool,
+    final_norm: bool,
+    learnable_gamma: bool,
     seed: Option<u64>,
     temperature: f64,
     samples: usize,
@@ -458,8 +458,8 @@ impl Default for Args {
             grad_clip: 0.0,
             lr_schedule: LrSchedule::Linear,
             activation: Activation::Relu,
-            no_final_norm: true,
-            no_learnable_gamma: true,
+            final_norm: false,
+            learnable_gamma: false,
             seed: None,
             temperature: 0.5,
             samples: 20,
@@ -533,8 +533,8 @@ fn main() {
                 head_dim: args.n_embd / args.n_head,
                 vocab_size: tokenizer.vocab_size(),
                 activation: args.activation,
-                no_final_norm: args.no_final_norm,
-                no_learnable_gamma: args.no_learnable_gamma,
+                final_norm: args.final_norm,
+                learnable_gamma: args.learnable_gamma,
                 dropout: args.dropout,
             };
             let params = Params::new(&config, &mut rng, args.init_scale);
