@@ -800,42 +800,57 @@ fn test_swiglu_gate_gradient_numerical() {
     let model = GptModel::build(&config);
     let tokens = tokenizer.encode(&docs[0]);
 
-    // Get analytical gradients via backward pass
+    // Get analytical gradients via backward pass using a fixed seed for reproducibility.
     let nt = n_trainable(&config, params.len());
     let mut grads = vec![0.0; nt];
-    forward_backward(&params, &config, &model, &tokens, &mut grads, &mut rng);
+    forward_backward(&params, &config, &model, &tokens, &mut grads, &mut StdRng::seed_from_u64(99));
 
-    // Spot-check gate weight gradients via finite differences.
-    // Gate weights start after wq+wk+wv+wo = 4*e*e attention params,
-    // offset by the global embeddings (wte + wpe + lm_head).
+    // Spot-check weight gradients via finite differences.
+    // Parameter layout for layer 0 (after wte + wpe + lm_head):
+    //   global_off + [wq|wk|wv|wo](4e²) + [gate](4e²) + [fc1/up](4e²) + [fc2/down](4e²)
     let e = config.n_embd;
     let global_off = config.vocab_size * e + config.block_size * e + config.vocab_size * e;
-    let gate_start = global_off + 4 * e * e; // start of gate weights in layer 0
+    let gate_start = global_off + 4 * e * e; // gate projection weights
+    let fc1_start = gate_start + 4 * e * e;  // up projection weights
     let h = 1e-5;
 
-    // Check a few gate weight indices
-    for &idx in &[gate_start, gate_start + 1, gate_start + 4 * e * e - 1] {
+    // Check gate weights and fc1 (up-projection) weights — both flow through the gate⊙up product.
+    let check_indices = [
+        gate_start,
+        gate_start + 1,
+        gate_start + 4 * e * e - 1,
+        fc1_start,
+        fc1_start + 1,
+        fc1_start + 4 * e * e - 1,
+    ];
+    for &idx in &check_indices {
         if idx >= nt {
             continue;
         }
         let mut p_plus = params.clone();
         p_plus.data[idx] += h;
         let mut g_dummy = vec![0.0; nt];
-        let loss_plus = forward_backward(&p_plus, &config, &model, &tokens, &mut g_dummy, &mut rng);
+        // Use the same fixed seed for every perturbed run so stochastic ops (e.g. dropout)
+        // do not introduce noise into the finite-difference estimate.
+        let loss_plus = forward_backward(
+            &p_plus, &config, &model, &tokens, &mut g_dummy, &mut StdRng::seed_from_u64(99),
+        );
 
         let mut p_minus = params.clone();
         p_minus.data[idx] -= h;
         g_dummy.iter_mut().for_each(|g| *g = 0.0);
-        let loss_minus =
-            forward_backward(&p_minus, &config, &model, &tokens, &mut g_dummy, &mut rng);
+        let loss_minus = forward_backward(
+            &p_minus, &config, &model, &tokens, &mut g_dummy, &mut StdRng::seed_from_u64(99),
+        );
 
         let numerical = (loss_plus - loss_minus) / (2.0 * h);
         let analytical = grads[idx];
         let denom = analytical.abs().max(numerical.abs()).max(1e-8);
         let rel_err = (analytical - numerical).abs() / denom;
+        let label = if idx < fc1_start { "gate" } else { "fc1/up" };
         assert!(
             rel_err < 1e-4,
-            "SwiGLU gate grad mismatch at param {idx}: analytical={analytical:.8} numerical={numerical:.8} rel_err={rel_err:.6}"
+            "SwiGLU {label} grad mismatch at param {idx}: analytical={analytical:.8} numerical={numerical:.8} rel_err={rel_err:.6}"
         );
     }
 }

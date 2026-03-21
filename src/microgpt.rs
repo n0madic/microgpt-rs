@@ -3,8 +3,8 @@
 //! Rewritten from Karpathy's microgpt.py — same architecture, idiomatic Rust.
 //! Tape-based autograd instead of pointer graph.
 
-use rand::Rng;
 use rand::rngs::StdRng;
+use rand::Rng;
 use rand_distr::StandardNormal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -453,7 +453,7 @@ impl GptConfig {
         let attn = 4 * e * e; // wq + wk + wv + wo
         let mlp = match self.activation {
             Activation::SwiGLU => 4 * e * e + 4 * e * e + e * 4 * e, // gate + fc1(up) + fc2(down)
-            _ => 4 * e * e + e * 4 * e,                               // fc1 + fc2
+            _ => 4 * e * e + e * 4 * e,                              // fc1 + fc2
         };
         attn + mlp
     }
@@ -473,12 +473,12 @@ impl GptConfig {
                 + 4 * e * 6                          // silu on gate output
                 + 4 * e * e + 4 * e                  // up linear (fc1)
                 + 4 * e                              // elementwise mul (gate ⊙ up)
-                + e * 4 * e + e                      // down linear (fc2)
+                + e * 4 * e + e // down linear (fc2)
             }
             _ => {
                 4 * e * e + 4 * e                    // fc1 linear
                 + 4 * e * 6                          // silu/relu
-                + e * 4 * e + e                      // fc2 linear
+                + e * 4 * e + e // fc2 linear
             }
         };
         let per_pos = e                              // tok+pos add
@@ -608,7 +608,7 @@ pub struct LayerModel {
     pub attn_wk: Vec<Vec<Idx>>,
     pub attn_wv: Vec<Vec<Idx>>,
     pub attn_wo: Vec<Vec<Idx>>,
-    pub mlp_gate: Vec<Vec<Idx>>,  // SwiGLU gate projection (4e × e), empty when unused
+    pub mlp_gate: Vec<Vec<Idx>>, // SwiGLU gate projection (4e × e), empty when unused
     pub mlp_fc1: Vec<Vec<Idx>>,
     pub mlp_fc2: Vec<Vec<Idx>>,
     pub attn_norm_gamma: Vec<Idx>,
@@ -1032,7 +1032,16 @@ pub fn adamw_step(
                 adam.lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
             }
         }
-        LrSchedule::Linear => adam.lr * (1.0 - step as f64 / num_steps as f64),
+        LrSchedule::Linear => {
+            // num_steps == 0 means "no schedule" — hold lr constant.
+            // Avoids 0/0 = NaN when the caller does not configure a step budget.
+            debug_assert!(num_steps > 0, "num_steps should be > 0 for Linear schedule; got 0 (constant LR used as fallback)");
+            if num_steps == 0 {
+                adam.lr
+            } else {
+                adam.lr * (1.0 - step as f64 / num_steps as f64)
+            }
+        }
     };
 
     // AdamW update (use f64 exponent to avoid i32 overflow at >2.1B steps)
@@ -1158,7 +1167,12 @@ pub fn gpt_forward_f64(
         let wv_off = wk_off + e * e;
         let wo_off = wv_off + e * e;
         let gate_off = wo_off + e * e;
-        let fc1_off = gate_off + if config.activation == Activation::SwiGLU { 4 * e * e } else { 0 };
+        let fc1_off = gate_off
+            + if config.activation == Activation::SwiGLU {
+                4 * e * e
+            } else {
+                0
+            };
         let fc2_off = fc1_off + 4 * e * e;
 
         let lg_off = layer_gamma_off + li * 2 * e;
