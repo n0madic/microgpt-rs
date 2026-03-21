@@ -53,10 +53,8 @@ Model:
   --block N       context window size [default: 16]
   --activation S  activation function: silu, relu, swiglu [default: relu]
   --init-scale S  weight init: flat, scaled [default: flat]
-  --no-final-norm skip final RMSNorm before lm_head (default: on)
-  --final-norm    enable final RMSNorm before lm_head
-  --no-learnable-gamma  freeze RMSNorm gamma at 1.0 (default: on)
-  --learnable-gamma     enable learnable RMSNorm gamma
+  --final-norm    enable final RMSNorm before lm_head [default: off]
+  --learnable-gamma  enable learnable RMSNorm gamma [default: off]
 
 Training:
   --steps N       training steps [default: 1000]

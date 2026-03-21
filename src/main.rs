@@ -54,10 +54,8 @@ fn parse_args() -> Args {
                        --block N       context window size [default: {}]\n  \
                        --activation S  activation function: silu, relu, swiglu [default: relu]\n  \
                        --init-scale S  weight init: flat, scaled [default: flat]\n  \
-                       --no-final-norm skip final RMSNorm before lm_head (default: on)\n  \
-                       --final-norm    enable final RMSNorm before lm_head\n  \
-                       --no-learnable-gamma  freeze RMSNorm gamma at 1.0 (default: on)\n  \
-                       --learnable-gamma     enable learnable RMSNorm gamma\n\n\
+                       --final-norm    enable final RMSNorm before lm_head [default: off]\n  \
+                       --learnable-gamma  enable learnable RMSNorm gamma [default: off]\n\n\
                      Training:\n  \
                        --steps N       training steps [default: {}]\n  \
                        --warmup N      LR warmup steps [default: {}]\n  \
@@ -167,14 +165,8 @@ fn parse_args() -> Args {
                     }
                 };
             }
-            "--no-final-norm" => {
-                args.final_norm = false;
-            }
             "--final-norm" => {
                 args.final_norm = true;
-            }
-            "--no-learnable-gamma" => {
-                args.learnable_gamma = false;
             }
             "--learnable-gamma" => {
                 args.learnable_gamma = true;
