@@ -12,6 +12,7 @@ Inspired by [Karpathy's microgpt.py](https://gist.github.com/karpathy/8627fe009c
 - **Tokenizer**: char-level (default) or BPE with configurable vocabulary size
 - **Checkpoint** save/load for trained models (architecture stored in file)
 - **Train/validation split** with tape-free validation loss
+- **Chinchilla scaling analysis**: pre-training diagnostic that checks whether model size and data budget are balanced (D ≈ 20×N), with warnings for over/under-parameterized configurations
 - **Epoch-based data re-shuffling** for better generalization
 - **OOV-safe tokenizer**: unknown characters are silently skipped during encoding
 - No frameworks, no BLAS, no GPU — just `rand` and `serde` crates
@@ -148,6 +149,7 @@ Key considerations when scaling:
 
 ```
 docs: 32033 | vocab: 27 (char) | params: 4256 | layers: 1 | embd: 16 | heads: 4
+chinchilla: N=4256 | D=7122 (0.0 epochs, 228146 unique) | D_optimal=85120 | N_optimal=356 | ratio=0.08
 step 1000 / 1000 | loss 2.1570 | avg100 2.3604 | eta 0s
 --- generated samples ---
 karay

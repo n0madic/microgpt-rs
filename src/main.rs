@@ -160,7 +160,9 @@ fn parse_args() -> Args {
                     "relu" => Activation::Relu,
                     "swiglu" => Activation::SwiGLU,
                     _ => {
-                        eprintln!("error: --activation must be 'silu', 'relu', or 'swiglu', got '{s}'");
+                        eprintln!(
+                            "error: --activation must be 'silu', 'relu', or 'swiglu', got '{s}'"
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -478,6 +480,107 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Chinchilla scaling law analysis
+// ---------------------------------------------------------------------------
+
+struct ChinchillaReport {
+    n_params: usize,
+    unique_tokens: usize,
+    d_total: usize,
+    d_optimal: usize,
+    n_optimal: usize,
+    epochs: f64,
+    ratio: f64,
+}
+
+fn chinchilla_analysis(
+    config: &GptConfig,
+    tokenizer: &Tokenizer,
+    train_docs: &[String],
+    steps: usize,
+    batch_size: usize,
+) -> ChinchillaReport {
+    let n_params = config.expected_n_params();
+
+    let unique_tokens: usize = train_docs
+        .iter()
+        .map(|doc| {
+            tokenizer
+                .encode(doc)
+                .len()
+                .saturating_sub(1)
+                .min(config.block_size)
+        })
+        .sum();
+
+    let avg_tokens = if train_docs.is_empty() {
+        0.0
+    } else {
+        unique_tokens as f64 / train_docs.len() as f64
+    };
+
+    let d_total = (steps as f64 * batch_size as f64 * avg_tokens) as usize;
+    let d_optimal = 20 * n_params;
+    let n_optimal = d_total / 20;
+    let epochs = if unique_tokens > 0 {
+        d_total as f64 / unique_tokens as f64
+    } else {
+        0.0
+    };
+    let ratio = if d_optimal > 0 {
+        d_total as f64 / d_optimal as f64
+    } else {
+        0.0
+    };
+
+    ChinchillaReport {
+        n_params,
+        unique_tokens,
+        d_total,
+        d_optimal,
+        n_optimal,
+        epochs,
+        ratio,
+    }
+}
+
+fn print_chinchilla_analysis(
+    config: &GptConfig,
+    tokenizer: &Tokenizer,
+    train_docs: &[String],
+    steps: usize,
+    batch_size: usize,
+) {
+    let r = chinchilla_analysis(config, tokenizer, train_docs, steps, batch_size);
+
+    println!(
+        "chinchilla: N={} | D={} ({:.1} epochs, {} unique) | D_optimal={} | N_optimal={} | ratio={:.2}",
+        r.n_params, r.d_total, r.epochs, r.unique_tokens, r.d_optimal, r.n_optimal, r.ratio
+    );
+
+    if r.ratio < 0.1 {
+        eprintln!(
+            "warning: chinchilla ratio {:.2} — model over-parameterized for data; \
+             consider reducing --embd/--layers or increasing --steps/data",
+            r.ratio
+        );
+    } else if r.ratio > 10.0 {
+        eprintln!(
+            "warning: chinchilla ratio {:.2} — model under-parameterized for data; \
+             consider increasing --embd/--layers or reducing --steps",
+            r.ratio
+        );
+    }
+
+    if r.epochs > 10.0 {
+        eprintln!(
+            "warning: {:.1} epochs over training data — heavy repetition may cause overfitting",
+            r.epochs
+        );
+    }
+}
+
 fn main() {
     let args = parse_args();
     let seed = args.seed.unwrap_or_else(|| {
@@ -566,6 +669,8 @@ fn main() {
         let val_count = (docs.len() as f64 * args.val_split) as usize;
         let val_docs: Vec<String> = docs.drain(docs.len() - val_count..).collect();
         let train_docs = docs;
+
+        print_chinchilla_analysis(&config, &tokenizer, &train_docs, args.steps, batch_size);
 
         let model = GptModel::build(&config);
         let nt = n_trainable(&config, params.len());

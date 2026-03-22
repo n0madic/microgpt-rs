@@ -755,8 +755,15 @@ fn test_swiglu_tape_matches_f64() {
     let mut keys_tape: Vec<Vec<Vec<Idx>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
     let mut vals_tape: Vec<Vec<Vec<Idx>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
     let logits_tape = gpt_forward(
-        &mut tape, &model, &config, &c, token_id, 0,
-        &mut keys_tape, &mut vals_tape, &mut rng,
+        &mut tape,
+        &model,
+        &config,
+        &c,
+        token_id,
+        0,
+        &mut keys_tape,
+        &mut vals_tape,
+        &mut rng,
     );
     let tape_vals: Vec<f64> = logits_tape.iter().map(|&idx| tape.val(idx)).collect();
 
@@ -764,8 +771,12 @@ fn test_swiglu_tape_matches_f64() {
     let mut keys_f64: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
     let mut vals_f64: Vec<Vec<Vec<f64>>> = (0..config.n_layer).map(|_| Vec::new()).collect();
     let logits_f64 = gpt_forward_f64(
-        &params.data, &config, token_id, 0,
-        &mut keys_f64, &mut vals_f64,
+        &params.data,
+        &config,
+        token_id,
+        0,
+        &mut keys_f64,
+        &mut vals_f64,
     );
 
     assert_eq!(tape_vals.len(), logits_f64.len());
@@ -803,7 +814,14 @@ fn test_swiglu_gate_gradient_numerical() {
     // Get analytical gradients via backward pass using a fixed seed for reproducibility.
     let nt = n_trainable(&config, params.len());
     let mut grads = vec![0.0; nt];
-    forward_backward(&params, &config, &model, &tokens, &mut grads, &mut StdRng::seed_from_u64(99));
+    forward_backward(
+        &params,
+        &config,
+        &model,
+        &tokens,
+        &mut grads,
+        &mut StdRng::seed_from_u64(99),
+    );
 
     // Spot-check weight gradients via finite differences.
     // Parameter layout for layer 0 (after wte + wpe + lm_head):
@@ -811,7 +829,7 @@ fn test_swiglu_gate_gradient_numerical() {
     let e = config.n_embd;
     let global_off = config.vocab_size * e + config.block_size * e + config.vocab_size * e;
     let gate_start = global_off + 4 * e * e; // gate projection weights
-    let fc1_start = gate_start + 4 * e * e;  // up projection weights
+    let fc1_start = gate_start + 4 * e * e; // up projection weights
     let h = 1e-5;
 
     // Check gate weights and fc1 (up-projection) weights — both flow through the gate⊙up product.
@@ -833,14 +851,24 @@ fn test_swiglu_gate_gradient_numerical() {
         // Use the same fixed seed for every perturbed run so stochastic ops (e.g. dropout)
         // do not introduce noise into the finite-difference estimate.
         let loss_plus = forward_backward(
-            &p_plus, &config, &model, &tokens, &mut g_dummy, &mut StdRng::seed_from_u64(99),
+            &p_plus,
+            &config,
+            &model,
+            &tokens,
+            &mut g_dummy,
+            &mut StdRng::seed_from_u64(99),
         );
 
         let mut p_minus = params.clone();
         p_minus.data[idx] -= h;
         g_dummy.iter_mut().for_each(|g| *g = 0.0);
         let loss_minus = forward_backward(
-            &p_minus, &config, &model, &tokens, &mut g_dummy, &mut StdRng::seed_from_u64(99),
+            &p_minus,
+            &config,
+            &model,
+            &tokens,
+            &mut g_dummy,
+            &mut StdRng::seed_from_u64(99),
         );
 
         let numerical = (loss_plus - loss_minus) / (2.0 * h);
@@ -1061,4 +1089,63 @@ fn test_shuffle_preserves_elements() {
         data, original,
         "shuffle should change order (may rarely fail)"
     );
+}
+
+// --- (q) Chinchilla scaling analysis ---
+
+#[test]
+fn test_chinchilla_analysis_basic() {
+    let docs = vec!["abcabc".to_string(), "defdef".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        final_norm: false,
+        learnable_gamma: false,
+        dropout: 0.0,
+    };
+
+    let r = chinchilla_analysis(&config, &tokenizer, &docs, 100, 2);
+
+    assert_eq!(r.n_params, config.expected_n_params());
+    assert_eq!(r.d_optimal, 20 * r.n_params);
+    assert!(r.unique_tokens > 0);
+    assert!(r.d_total > 0);
+    assert!(r.epochs > 0.0);
+    assert!(r.ratio > 0.0);
+    // d_total should equal steps * batch_size * avg_tokens
+    let avg = r.unique_tokens as f64 / docs.len() as f64;
+    let expected_d = (100.0 * 2.0 * avg) as usize;
+    assert_eq!(r.d_total, expected_d);
+    assert_eq!(r.n_optimal, r.d_total / 20);
+}
+
+#[test]
+fn test_chinchilla_analysis_empty_docs() {
+    let docs: Vec<String> = vec!["abc".to_string()];
+    let tokenizer = Tokenizer::from_docs_char(&docs);
+    let config = GptConfig {
+        n_layer: 1,
+        n_embd: 4,
+        block_size: 4,
+        n_head: 2,
+        head_dim: 2,
+        vocab_size: tokenizer.vocab_size(),
+        activation: Activation::Relu,
+        final_norm: false,
+        learnable_gamma: false,
+        dropout: 0.0,
+    };
+
+    let r = chinchilla_analysis(&config, &tokenizer, &[], 100, 1);
+
+    assert_eq!(r.unique_tokens, 0);
+    assert_eq!(r.d_total, 0);
+    assert_eq!(r.epochs, 0.0);
+    assert_eq!(r.ratio, 0.0);
 }
