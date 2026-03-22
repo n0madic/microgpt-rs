@@ -3,8 +3,8 @@
 //! Rewritten from Karpathy's microgpt.py — same architecture, idiomatic Rust.
 //! Tape-based autograd instead of pointer graph.
 
-use rand::rngs::StdRng;
 use rand::Rng;
+use rand::rngs::StdRng;
 use rand_distr::StandardNormal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1046,7 +1046,10 @@ pub fn adamw_step(
         LrSchedule::Linear => {
             // num_steps == 0 means "no schedule" — hold lr constant.
             // Avoids 0/0 = NaN when the caller does not configure a step budget.
-            debug_assert!(num_steps > 0, "num_steps should be > 0 for Linear schedule; got 0 (constant LR used as fallback)");
+            debug_assert!(
+                num_steps > 0,
+                "num_steps should be > 0 for Linear schedule; got 0 (constant LR used as fallback)"
+            );
             if num_steps == 0 {
                 adam.lr
             } else {
